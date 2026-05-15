@@ -41,13 +41,14 @@ function main()
     )
     bundle = get_bundle(rng, "regression_recovery_bundle.jls", config)
     burn = 1_000
-    fit = mala(rng, bundle.regression_model, bundle.supervised_data;
-               nsweeps = 4_000, burn = burn, thin = 4,
-               step_β = 0.20, step_t = 0.80, save_chain = false)
+    fit = hmc(rng, bundle.regression_model, bundle.supervised_data;
+              nsweeps = 4_000, n_adapts = burn, burn = burn, thin = 4,
+              target_accept = 0.85, max_depth = 10, save_chain = false)
     path = diagnostic_plot(fit.t_trace, fit.logpost; burn = burn, path = "regression_chain_diagnostics.png")
     println("saved diagnostics plot: ", abspath(path))
     println("posterior mean t after burn: ", round(mean(fit.t_trace[burn + 1:end]), digits = 4))
-    println("acceptance: beta=", round(fit.accept_β, digits = 3), ", t=", round(fit.accept_t, digits = 3))
+    println("mean acceptance: ", round(fit.mean_acceptance, digits = 3))
+    println("divergence rate: ", round(fit.divergence_rate, digits = 3))
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__

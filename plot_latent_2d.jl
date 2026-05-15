@@ -32,7 +32,7 @@ function simulate_latent(rng; p = 100, npatients = 4, nobs = 50)
     end
     data = LatentData(X)
     truth = GibbsState(LatentGMM(pi, mu, lambda, Σ), z)
-    canonicalize!(truth, projection_direction(data))
+    canonicalize!(truth, projection_basis(data))
     data, truth
 end
 

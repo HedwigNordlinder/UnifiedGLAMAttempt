@@ -44,9 +44,10 @@ end
 rand_β(rng::AbstractRNG, prior::Distribution, p::Int) =
     error("No β sampler implemented for $(typeof(prior)).")
 
-function simulate_latent_truth(rng::AbstractRNG, config::SimulationConfig{T}) where {T}
+function simulate_latent_truth(rng::AbstractRNG, config::SimulationConfig{T}; cluster_mean_shift = one(T)) where {T}
     prior = config.latent_prior
     p = length(prior.m0)
+    centers = cluster_mean_centers(prior, cluster_mean_shift)
     Sigma = ntuple(k -> Matrix(rand(rng, InverseWishart(prior.nu0, PDMat(Symmetric(prior.S0[k]))))), 2)
     pi = rand(rng, Beta(prior.alpha0, prior.beta0), config.npatients)
     lambda = rand(rng, Gamma(prior.a0, inv(prior.b0)), config.npatients, 2)
@@ -59,7 +60,7 @@ function simulate_latent_truth(rng::AbstractRNG, config::SimulationConfig{T}) wh
         z[i] = BitVector(zi)
         Mi = Matrix{T}(undef, p, 2)
         for k in 1:2
-            Mi[:, k] .= rand_precision_normal(rng, prior.Lambda0, prior.Lambda0 * prior.m0)
+            Mi[:, k] .= rand_precision_normal(rng, prior.Lambda0, prior.Lambda0 * centers[k])
         end
         mu[i] = Mi
         Xi = Matrix{T}(undef, p, ni)
@@ -71,7 +72,7 @@ function simulate_latent_truth(rng::AbstractRNG, config::SimulationConfig{T}) wh
     end
     data = LatentData(X)
     truth = GibbsState(LatentGMM(pi, mu, lambda, Sigma), z)
-    canonicalize!(truth, projection_direction(data))
+    canonicalize!(truth, projection_basis(data))
     data, truth
 end
 
@@ -168,8 +169,8 @@ function load_bundle(path::AbstractString)
     error("Unrecognized bundle format: $path")
 end
 
-function simulate_dataset(rng::AbstractRNG, config::SimulationConfig{T}; stem = "simulation_bundle") where {T}
-    latent_data, latent_truth = simulate_latent_truth(rng, config)
+function simulate_dataset(rng::AbstractRNG, config::SimulationConfig{T}; stem = "simulation_bundle", cluster_mean_shift = one(T)) where {T}
+    latent_data, latent_truth = simulate_latent_truth(rng, config; cluster_mean_shift)
     supervised_data, regression_truth = simulate_regression_truth(rng, config, latent_truth)
     plot_path = plot_simulation_summary(latent_data, latent_truth, regression_truth, supervised_data; path = "$(stem)_summary.png")
     stats = patient_stats(latent_data, latent_truth, regression_truth, supervised_data)
@@ -181,6 +182,8 @@ function simulate_dataset(rng::AbstractRNG, config::SimulationConfig{T}; stem = 
         regression_model = RegressionModel(config.β_prior),
         regression_truth,
         stats,
+        latent_cluster_mean_shift = cluster_mean_shift,
+        latent_cluster_centers = cluster_mean_centers(config.latent_prior, cluster_mean_shift),
         summary_plot = abspath(plot_path),
     )
     paths = save_bundle(bundle; stem)

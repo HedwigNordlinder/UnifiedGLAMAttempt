@@ -63,8 +63,8 @@ function pipeline_plot(alloc_logpost, imap, reg_fit, β_true; t_true, burn = 0, 
     plot!(plt[6]; framestyle = :none, grid = false, ticks = false, xlims = (0, 1), ylims = (0, 1))
     annotate!(plt[6], 0.02, 0.92, text("MAP pipeline summary", 13, :left))
     annotate!(plt[6], 0.02, 0.76, text(@sprintf("allocation MAP iter: %d", imap), 11, :left))
-    annotate!(plt[6], 0.02, 0.60, text(@sprintf("reg acceptance beta: %.3f", reg_fit.accept_β), 11, :left))
-    annotate!(plt[6], 0.02, 0.46, text(@sprintf("reg acceptance t: %.3f", reg_fit.accept_t), 11, :left))
+    annotate!(plt[6], 0.02, 0.60, text(@sprintf("reg mean accept: %.3f", reg_fit.mean_acceptance), 11, :left))
+    annotate!(plt[6], 0.02, 0.46, text(@sprintf("reg divergence: %.3f", reg_fit.divergence_rate), 11, :left))
     annotate!(plt[6], 0.02, 0.30, text(@sprintf("true t: %.3f", t_true), 11, :left))
     annotate!(plt[6], 0.02, 0.16, text(@sprintf("post mean t: %.3f", mean(reg_fit.t_chain)), 11, :left))
 
@@ -76,24 +76,25 @@ function main()
     rng = MersenneTwister(20260515)
     p = 100
     T = Float64
+    cluster_mean_shift = one(T)
     config = SimulationConfig(
-        100,
+        1000,
         8:14,
         LatentPrior(T(2), T(2), zeros(T, p), T(2) * Matrix{T}(I, p, p), T(2), T(2), T(p + 3), (Matrix{T}(I, p, p), Matrix{T}(I, p, p))),
         Normal(T(0), T(0.5)),
         Uniform(T(0), T(1)),
     )
-    sim = simulate_dataset(rng, config; stem = "map_pipeline_bundle")
+    sim = simulate_dataset(rng, config; stem = "map_pipeline_bundle", cluster_mean_shift)
 
     alloc_fit = gibbs(rng, sim.bundle.latent_data, config.latent_prior;
-                      nsweeps = 250, burn = 0, thin = 1, save_states = true)
+                      nsweeps = 250, burn = 0, thin = 1, save_states = true, cluster_mean_shift)
     imap = argmax(alloc_fit.logpost)
     map_state = alloc_fit.states[imap]
     map_supervised = supervised_from_map(sim.bundle.latent_data, map_state, sim.bundle.supervised_data.y)
 
-    reg_fit = mala(rng, sim.bundle.regression_model, map_supervised;
-                   nsweeps = 3_000, burn = 750, thin = 3,
-                   step_β = 0.32, step_t = 1.20, save_chain = true)
+    reg_fit = hmc(rng, sim.bundle.regression_model, map_supervised;
+                  nsweeps = 3_000, n_adapts = 750, burn = 750, thin = 3,
+                  target_accept = 0.9, max_depth = 10, save_chain = true)
 
     plot_path = pipeline_plot(alloc_fit.logpost, imap, reg_fit, sim.bundle.regression_truth.β;
                               t_true = sim.bundle.regression_truth.t, burn = 750, path = "map_pipeline.png")
@@ -103,7 +104,8 @@ function main()
     println("allocation MAP iteration: ", imap)
     println("posterior mean t: ", round(mean(reg_fit.t_chain), digits = 4))
     println("true t: ", round(sim.bundle.regression_truth.t, digits = 4))
-    println("acceptance: beta=", round(reg_fit.accept_β, digits = 3), ", t=", round(reg_fit.accept_t, digits = 3))
+    println("mean acceptance: ", round(reg_fit.mean_acceptance, digits = 3))
+    println("divergence rate: ", round(reg_fit.divergence_rate, digits = 3))
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__

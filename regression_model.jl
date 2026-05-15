@@ -1,4 +1,5 @@
-using LinearAlgebra, Random, Distributions
+using LinearAlgebra, Random, Statistics, Distributions
+using AdvancedHMC, LogDensityProblems, LogDensityProblemsAD, Zygote
 
 struct SupervisedData{T<:AbstractFloat,Y<:Real}
     cluster_a_μ::Matrix{T}   # n x p
@@ -13,23 +14,35 @@ struct RegressionModel{P<:Distribution}
     β_prior::P
 end
 
+const LOG2PI = log(2 * pi)
+
 softplus(x) = max(x, zero(x)) + log1p(exp(-abs(x)))
 logsigmoid(x) = -softplus(-x)
 log1msigmoid(x) = -softplus(x)
 sigmoid(x) = x >= 0 ? inv(one(x) + exp(-x)) : exp(x) / (one(x) + exp(x))
 logit(x) = log(x) - log1p(-x)
 
-β_logprior(prior::UnivariateDistribution, β) = sum(logpdf.(Ref(prior), β))
-β_logprior(prior::MultivariateDistribution, β) = logpdf(prior, β)
+function β_logprior(prior::Normal, β::AbstractVector)
+    μ = mean(prior)
+    σ = std(prior)
+    z = (β .- μ) ./ σ
+    -0.5 * sum(abs2, z) - length(β) * (log(σ) + 0.5 * LOG2PI)
+end
+
+function β_logprior(prior::MvNormal, β::AbstractVector)
+    δ = β .- mean(prior)
+    -0.5 * (dot(δ, invcov(prior) * δ) + length(β) * LOG2PI + logdetcov(prior))
+end
+
+β_logprior(prior::UnivariateDistribution, β::AbstractVector) = sum(logpdf.(Ref(prior), β))
+β_logprior(prior::MultivariateDistribution, β::AbstractVector) = logpdf(prior, β)
 t_logprior(t) = 0.0 <= t <= 1.0 ? 0.0 : -Inf
 
 function logits(data::SupervisedData, β::AbstractVector, t::Real)
     t .* (data.cluster_a_μ * β) .+ (1 - t) .* (data.cluster_b_μ * β)
 end
 
-function ℓ_prior(model::RegressionModel, β::AbstractVector)
-    β_logprior(model.β_prior, β)
-end
+ℓ_prior(model::RegressionModel, β::AbstractVector) = β_logprior(model.β_prior, β)
 
 function ℓ_likelihood(data::SupervisedData, β::AbstractVector, t::Real)
     η = logits(data, β, t)
@@ -44,134 +57,138 @@ function ℓ_posterior(model::RegressionModel, data::SupervisedData, β::Abstrac
     t_logprior(t) + ℓ_prior(model, β) + ℓ_likelihood(data, β, t)
 end
 
-function ∇β_ℓ_prior(prior::Normal, β::AbstractVector)
-    @. -(β - mean(prior)) / var(prior)
+function transformed_logtarget(model::RegressionModel, data::SupervisedData, β::AbstractVector, u::Real)
+    t = sigmoid(u)
+    ℓ_posterior(model, data, β, t) + logsigmoid(u) + log1msigmoid(u)
 end
 
-function ∇β_ℓ_prior(prior::MvNormal, β::AbstractVector)
-    -(Matrix(invcov(prior)) * (β .- mean(prior)))
+supports_hmc_prior(::Normal) = true
+supports_hmc_prior(::MvNormal) = true
+supports_hmc_prior(::Distribution) = false
+
+struct RegressionTarget{M<:RegressionModel,D<:SupervisedData}
+    model::M
+    data::D
 end
 
-∇β_ℓ_prior(prior::Distribution, β::AbstractVector) =
-    error("No analytic β-prior gradient implemented for $(typeof(prior)).")
+LogDensityProblems.dimension(target::RegressionTarget) = size(target.data.cluster_a_μ, 2) + 1
+LogDensityProblems.capabilities(::Type{<:RegressionTarget}) = LogDensityProblems.LogDensityOrder{0}()
 
-function ∇β_ℓ_likelihood(data::SupervisedData, β::AbstractVector, t::Real)
-    η = logits(data, β, t)
-    r = similar(η)
-    @inbounds for i in eachindex(r, η, data.y)
-        r[i] = data.y[i] - sigmoid(η[i])
-    end
-    t .* (data.cluster_a_μ' * r) .+ (1 - t) .* (data.cluster_b_μ' * r)
+function LogDensityProblems.logdensity(target::RegressionTarget, θ::AbstractVector{<:Real})
+    p = size(target.data.cluster_a_μ, 2)
+    length(θ) == p + 1 || error("Expected parameter vector of length $(p + 1), got $(length(θ)).")
+    β = θ[1:p]
+    u = θ[p + 1]
+    transformed_logtarget(target.model, target.data, β, u)
 end
 
-function ∇t_ℓ_likelihood(data::SupervisedData, β::AbstractVector, t::Real)
-    aβ = data.cluster_a_μ * β
-    bβ = data.cluster_b_μ * β
-    s = zero(promote_type(eltype(aβ), eltype(data.y)))
-    @inbounds for i in eachindex(aβ, bβ, data.y)
-        η = t * aβ[i] + (1 - t) * bβ[i]
-        s += (data.y[i] - sigmoid(η)) * (aβ[i] - bβ[i])
-    end
-    s
-end
-
-mutable struct MALAState{T<:AbstractFloat}
+mutable struct RegressionHMCState{T<:AbstractFloat}
     β::Vector{T}
     u::T
     loglik::T
     logpost::T
 end
 
-t(state::MALAState) = sigmoid(state.u)
-snapshot(state::MALAState{T}) where {T} = MALAState(copy(state.β), state.u, state.loglik, state.logpost)
+t(state::RegressionHMCState) = sigmoid(state.u)
+snapshot(state::RegressionHMCState{T}) where {T} = RegressionHMCState(copy(state.β), state.u, state.loglik, state.logpost)
 
-function mala_state(model::RegressionModel, data::SupervisedData, β::AbstractVector, t0::Real)
-    0.0 < t0 < 1.0 || error("Initial t must lie strictly inside (0, 1).")
-    β0 = collect(float.(β))
-    t1 = float(t0)
-    MALAState(β0, logit(t1), ℓ_likelihood(data, β0, t1), ℓ_posterior(model, data, β0, t1))
+function hmc_state(model::RegressionModel, data::SupervisedData, θ::AbstractVector)
+    p = size(data.cluster_a_μ, 2)
+    β = collect(float.(θ[1:p]))
+    u = float(θ[p + 1])
+    tt = sigmoid(u)
+    RegressionHMCState(β, u, ℓ_likelihood(data, β, tt), ℓ_posterior(model, data, β, tt))
 end
 
-function transformed_logtarget(model::RegressionModel, data::SupervisedData, β::AbstractVector, u::Real)
-    t = sigmoid(u)
-    ℓ_posterior(model, data, β, t) + logsigmoid(u) + log1msigmoid(u)
+function regression_logdensity_model(model::RegressionModel, data::SupervisedData)
+    supports_hmc_prior(model.β_prior) || error("Joint HMC currently supports Normal or MvNormal priors for β.")
+    target = RegressionTarget(model, data)
+    AdvancedHMC.LogDensityModel(LogDensityProblemsAD.ADgradient(Val(:Zygote), target))
 end
 
-function transformed_gradient(model::RegressionModel, data::SupervisedData, β::AbstractVector, u::Real)
-    t = sigmoid(u)
-    gβ = ∇β_ℓ_prior(model.β_prior, β) + ∇β_ℓ_likelihood(data, β, t)
-    gu = t * (1 - t) * ∇t_ℓ_likelihood(data, β, t) + (1 - 2t)
-    gβ, gu
-end
+statfield(stat, name::Symbol, default) = hasproperty(stat, name) ? getproperty(stat, name) : default
 
-gaussian_logkernel(x::AbstractVector, m::AbstractVector, step::Real) = -0.5 * sum(abs2, x .- m) / step^2
-gaussian_logkernel(x::Real, m::Real, step::Real) = -0.5 * abs2(x - m) / step^2
+function hmc(rng::AbstractRNG, model::RegressionModel, data::SupervisedData;
+             nsweeps = 1_000, n_adapts = min(div(nsweeps, 2), 1_000), burn = n_adapts, thin = 1,
+             init_β = zeros(size(data.cluster_a_μ, 2)), init_t = 0.5,
+             target_accept = 0.8, max_depth = 10, save_states = false, save_chain = true,
+             progress = false, verbose = false)
+    0.0 < init_t < 1.0 || error("Initial t must lie strictly inside (0, 1).")
+    1 <= nsweeps || error("nsweeps must be positive.")
+    0 <= n_adapts < nsweeps || error("n_adapts must satisfy 0 <= n_adapts < nsweeps.")
+    0 <= burn < nsweeps || error("burn must satisfy 0 <= burn < nsweeps.")
+    thin >= 1 || error("thin must be at least 1.")
 
-function mala_step_β!(rng::AbstractRNG, model::RegressionModel, data::SupervisedData, state::MALAState; step::Real = 0.05)
-    gβ, _ = transformed_gradient(model, data, state.β, state.u)
-    m = state.β .+ 0.5 * step^2 .* gβ
-    βp = m .+ step .* randn(rng, length(state.β))
-    lp = transformed_logtarget(model, data, βp, state.u)
-    gβp, _ = transformed_gradient(model, data, βp, state.u)
-    mp = βp .+ 0.5 * step^2 .* gβp
-    logα = lp - transformed_logtarget(model, data, state.β, state.u) +
-           gaussian_logkernel(state.β, mp, step) - gaussian_logkernel(βp, m, step)
-    if log(rand(rng)) < logα
-        state.β .= βp
-        state.loglik = ℓ_likelihood(data, state.β, t(state))
-        state.logpost = ℓ_posterior(model, data, state.β, t(state))
-        return true
-    end
-    false
-end
+    p = size(data.cluster_a_μ, 2)
+    length(init_β) == p || error("Expected init_β to have length $p, got $(length(init_β)).")
 
-function mala_step_t!(rng::AbstractRNG, model::RegressionModel, data::SupervisedData, state::MALAState; step::Real = 0.1)
-    _, gu = transformed_gradient(model, data, state.β, state.u)
-    m = state.u + 0.5 * step^2 * gu
-    up = m + step * randn(rng)
-    lp = transformed_logtarget(model, data, state.β, up)
-    _, gup = transformed_gradient(model, data, state.β, up)
-    mp = up + 0.5 * step^2 * gup
-    logα = lp - transformed_logtarget(model, data, state.β, state.u) +
-           gaussian_logkernel(state.u, mp, step) - gaussian_logkernel(up, m, step)
-    if log(rand(rng)) < logα
-        state.u = up
-        state.loglik = ℓ_likelihood(data, state.β, t(state))
-        state.logpost = ℓ_posterior(model, data, state.β, t(state))
-        return true
-    end
-    false
-end
+    density_model = regression_logdensity_model(model, data)
+    sampler = NUTS(target_accept; max_depth = max_depth)
+    θ0 = vcat(collect(float.(init_β)), logit(float(init_t)))
+    draws = AdvancedHMC.AbstractMCMC.sample(
+        rng,
+        density_model,
+        sampler,
+        nsweeps;
+        n_adapts = n_adapts,
+        initial_params = θ0,
+        progress = progress,
+        verbose = verbose,
+    )
 
-function mala(rng::AbstractRNG, model::RegressionModel, data::SupervisedData;
-              nsweeps = 1_000, burn = 0, thin = 1, init_β = zeros(size(data.cluster_a_μ, 2)),
-              init_t = 0.5, step_β = 0.05, step_t = 0.1, save_states = false, save_chain = true)
-    state = mala_state(model, data, init_β, init_t)
     loglik = Vector{Float64}(undef, nsweeps)
     logpost = Vector{Float64}(undef, nsweeps)
+    logtarget = Vector{Float64}(undef, nsweeps)
     t_trace = Vector{Float64}(undef, nsweeps)
-    nkeep = burn < nsweeps ? cld(nsweeps - burn, thin) : 0
-    states = save_states ? Vector{MALAState{Float64}}(undef, nkeep) : nothing
-    β_chain = save_chain ? Matrix{Float64}(undef, nkeep, length(state.β)) : nothing
+    accept_trace = Vector{Float64}(undef, nsweeps)
+    step_size = Vector{Float64}(undef, nsweeps)
+    nom_step_size = Vector{Float64}(undef, nsweeps)
+    tree_depth = Vector{Int}(undef, nsweeps)
+    numerical_error = BitVector(undef, nsweeps)
+    is_adapt = BitVector(undef, nsweeps)
+
+    nkeep = cld(nsweeps - burn, thin)
+    states = save_states ? Vector{RegressionHMCState{Float64}}(undef, nkeep) : nothing
+    β_chain = save_chain ? Matrix{Float64}(undef, nkeep, p) : nothing
     t_chain = save_chain ? Vector{Float64}(undef, nkeep) : nothing
     saved = 0
-    acc_β = 0
-    acc_t = 0
+
     for it in 1:nsweeps
-        acc_β += mala_step_β!(rng, model, data, state; step = step_β)
-        acc_t += mala_step_t!(rng, model, data, state; step = step_t)
-        loglik[it] = state.loglik
-        logpost[it] = state.logpost
-        t_trace[it] = t(state)
-        if save_states && it > burn && (it - burn) % thin == 0
+        draw = draws[it]
+        θ = draw.z.θ
+        β = θ[1:p]
+        u = θ[p + 1]
+        tt = sigmoid(u)
+        stat = draw.stat
+
+        loglik[it] = ℓ_likelihood(data, β, tt)
+        logpost[it] = ℓ_posterior(model, data, β, tt)
+        logtarget[it] = transformed_logtarget(model, data, β, u)
+        t_trace[it] = tt
+        accept_trace[it] = Float64(statfield(stat, :acceptance_rate, NaN))
+        step_size[it] = Float64(statfield(stat, :step_size, NaN))
+        nom_step_size[it] = Float64(statfield(stat, :nom_step_size, NaN))
+        tree_depth[it] = Int(statfield(stat, :tree_depth, 0))
+        numerical_error[it] = Bool(statfield(stat, :numerical_error, false))
+        is_adapt[it] = Bool(statfield(stat, :is_adapt, false))
+
+        if it > burn && (it - burn) % thin == 0
             saved += 1
-            states[saved] = snapshot(state)
-            save_chain && (β_chain[saved, :] .= state.β; t_chain[saved] = t(state))
-        elseif save_chain && it > burn && (it - burn) % thin == 0
-            saved += 1
-            β_chain[saved, :] .= state.β
-            t_chain[saved] = t(state)
+            if save_states
+                states[saved] = RegressionHMCState(copy(β), u, loglik[it], logpost[it])
+            end
+            if save_chain
+                β_chain[saved, :] .= β
+                t_chain[saved] = tt
+            end
         end
     end
-    (; state, loglik, logpost, t_trace, states, β_chain, t_chain, accept_β = acc_β / nsweeps, accept_t = acc_t / nsweeps)
+
+    post_start = n_adapts < nsweeps ? n_adapts + 1 : nsweeps
+    state = hmc_state(model, data, draws[end].z.θ)
+    (; state, loglik, logpost, logtarget, t_trace, states, β_chain, t_chain,
+       accept_trace, step_size, nom_step_size, tree_depth, numerical_error, is_adapt,
+       mean_acceptance = mean(accept_trace[post_start:end]),
+       divergence_rate = mean(Float64.(numerical_error[post_start:end])),
+       mean_tree_depth = mean(Float64.(tree_depth[post_start:end])))
 end

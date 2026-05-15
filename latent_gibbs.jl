@@ -24,13 +24,21 @@ empirical_cov(X) = begin
     C * C' / max(n - 1, 1)
 end
 
-function projection_direction(data::LatentData{T}) where {T}
+function projection_basis(data::LatentData{T}; ndirs::Int = min(3, size(data.X[1], 1))) where {T}
     E = eigen(Symmetric(empirical_cov(reduce(hcat, data.X))))
-    v = copy(E.vectors[:, argmax(E.values)])
-    j = argmax(abs.(v))
-    v[j] < 0 && (v .*= -one(T))
-    v
+    ord = sortperm(E.values; rev = true)
+    q = min(ndirs, length(ord))
+    V = Matrix{T}(undef, size(E.vectors, 1), q)
+    for ℓ in 1:q
+        v = copy(E.vectors[:, ord[ℓ]])
+        j = argmax(abs.(v))
+        v[j] < 0 && (v .*= -one(T))
+        V[:, ℓ] .= v
+    end
+    V
 end
+
+projection_direction(data::LatentData{T}) where {T} = vec(projection_basis(data; ndirs = 1))
 
 function default_prior(data::LatentData{T}; alpha0 = one(T), beta0 = one(T), a0 = T(2), b0 = T(2)) where {T}
     Xall = reduce(hcat, data.X)
@@ -40,10 +48,19 @@ function default_prior(data::LatentData{T}; alpha0 = one(T), beta0 = one(T), a0 
     LatentPrior(alpha0, beta0, vec(mean(Xall, dims = 2)), Matrix{T}(I, p, p) * (T(0.01) / scale), a0, b0, T(p + 2), (copy(S), copy(S)))
 end
 
-priorcache(prior::LatentPrior) = begin
-       F0 = cholesky(Hermitian(prior.Lambda0))
+function cluster_mean_centers(prior::LatentPrior{T}, cluster_mean_shift = zero(T)) where {T}
+    p = length(prior.m0)
+    shift = cluster_mean_shift isa AbstractVector ? collect(T, cluster_mean_shift) : fill(T(cluster_mean_shift), p)
+    length(shift) == p || error("cluster_mean_shift must be scalar or length $p, got length $(length(shift)).")
+    (prior.m0 .- shift, prior.m0 .+ shift)
+end
+
+priorcache(prior::LatentPrior{T}; cluster_mean_shift = zero(T)) where {T} = begin
+    F0 = cholesky(Hermitian(prior.Lambda0))
+    centers = cluster_mean_centers(prior, cluster_mean_shift)
     (; F0,
-       eta0 = prior.Lambda0 * prior.m0,
+       centers,
+       eta0 = ntuple(k -> prior.Lambda0 * centers[k], 2),
        logdet0 = 2sum(log, diag(F0.L)),
        beta = Beta(prior.alpha0, prior.beta0),
        gamma = Gamma(prior.a0, inv(prior.b0)),
@@ -108,32 +125,68 @@ function swap_labels!(state::GibbsState{T}) where {T}
     state
 end
 
+function contrast_preference(δ::AbstractVector{T}; tol = sqrt(eps(T))) where {T}
+    npos = count(>(tol), δ)
+    nneg = count(<(-tol), δ)
+    npos != nneg && return sign(T(npos - nneg))
+    scale = max(std(δ), one(T))
+    med = median(δ)
+    abs(med) > tol * scale && return sign(med)
+    mn = mean(δ)
+    abs(mn) > tol * scale && return sign(mn)
+    zero(T)
+end
+
 function canonicalize!(state::GibbsState{T}, v::AbstractVector{T}; tol = sqrt(eps(T))) where {T}
-    p = size(state.model.mu[1], 1)
-    m1, m2 = zeros(T, p), zeros(T, p)
-    w1, w2 = zero(T), zero(T)
-    for i in eachindex(state.model.mu)
-        n1 = count(state.z[i])
-        n2 = length(state.z[i]) - n1
-        n1 > 0 && (m1 .+= n1 .* view(state.model.mu[i], :, 1); w1 += n1)
-        n2 > 0 && (m2 .+= n2 .* view(state.model.mu[i], :, 2); w2 += n2)
+    canonicalize!(state, reshape(v, :, 1); tol)
+end
+
+function canonicalize!(state::GibbsState{T}, V::AbstractMatrix{T}; tol = sqrt(eps(T))) where {T}
+    ndirs = size(V, 2)
+    npatients = length(state.model.mu)
+    Δ = Matrix{T}(undef, ndirs, npatients)
+    for i in 1:npatients
+        Δ[:, i] .= V' * (view(state.model.mu[i], :, 2) - view(state.model.mu[i], :, 1))
     end
-    if w1 == 0 || w2 == 0
-        return state
+
+    pref = zero(T)
+    for d in 1:ndirs
+        pref = contrast_preference(view(Δ, d, :); tol)
+        pref != 0 && break
     end
-    m1 ./= w1
-    m2 ./= w2
-    δ = dot(v, m2 - m1)
-    if abs(δ) <= tol * max(norm(v) * max(norm(m1), norm(m2)), one(T))
-        δ = tr(state.model.Sigma[2]) - tr(state.model.Sigma[1])
-        if abs(δ) <= tol * max(tr(state.model.Sigma[1]) + tr(state.model.Sigma[2]), one(T))
-            for j in eachindex(m1)
-                δ = m2[j] - m1[j]
-                abs(δ) > tol && break
+
+    if pref == 0
+        p = size(state.model.mu[1], 1)
+        m1, m2 = zeros(T, p), zeros(T, p)
+        for M in state.model.mu
+            m1 .+= view(M, :, 1)
+            m2 .+= view(M, :, 2)
+        end
+        m1 ./= npatients
+        m2 ./= npatients
+        for d in 1:ndirs
+            δ = dot(view(V, :, d), m2 - m1)
+            if abs(δ) > tol * max(norm(view(V, :, d)) * max(norm(m1), norm(m2)), one(T))
+                pref = sign(δ)
+                break
+            end
+        end
+        if pref == 0
+            δ = tr(state.model.Sigma[2]) - tr(state.model.Sigma[1])
+            if abs(δ) > tol * max(tr(state.model.Sigma[1]) + tr(state.model.Sigma[2]), one(T))
+                pref = sign(δ)
+            else
+                for j in eachindex(m1)
+                    δ = m2[j] - m1[j]
+                    abs(δ) > tol || continue
+                    pref = sign(δ)
+                    break
+                end
             end
         end
     end
-    δ < 0 && swap_labels!(state)
+
+    pref < 0 && swap_labels!(state)
     state
 end
 
@@ -158,7 +211,7 @@ function logprior(model::LatentGMM{T}, prior::LatentPrior{T}; pcache = priorcach
         s += logpdf(pcache.beta, clamp(p, eps(T), one(T) - eps(T)))
     end
     for M in model.mu, k in 1:2
-        r = M[:, k] - prior.m0
+        r = M[:, k] - pcache.centers[k]
         v = pcache.F0.U * r
         s += 0.5 * (pcache.logdet0 - length(r) * log(2π) - dot(v, v))
     end
@@ -203,7 +256,7 @@ function gibbs_step!(rng::AbstractRNG, data::LatentData{T}, state::GibbsState{T}
                 n += 1
             end
             Q = prior.Lambda0 + (n * model.lambda[i, k]) * Sinv[k]
-            b = pcache.eta0 + model.lambda[i, k] * (Sinv[k] * sx)
+            b = pcache.eta0[k] + model.lambda[i, k] * (Sinv[k] * sx)
             Mui[:, k] .= rand_precision_normal(rng, Q, b)
         end
     end
@@ -244,11 +297,12 @@ end
 
 function gibbs(rng::AbstractRNG, data::LatentData{T}, prior::LatentPrior{T};
                nsweeps = 1_000, burn = 0, thin = 1, init = nothing, save_states = false,
-               postprocess = true, direction = nothing) where {T}
+               postprocess = true, direction = nothing, cluster_mean_shift = zero(T)) where {T}
     state = init === nothing ? init_state(rng, data, prior) : snapshot(init)
-    pcache = priorcache(prior)
-    v = direction === nothing ? projection_direction(data) : collect(T, direction)
-    postprocess && canonicalize!(state, v)
+    pcache = priorcache(prior; cluster_mean_shift)
+    V = direction === nothing ? projection_basis(data) :
+        direction isa AbstractVector ? reshape(T.(direction), :, 1) : Matrix{T}(direction)
+    postprocess && canonicalize!(state, V)
     loglik = Vector{T}(undef, nsweeps)
     logpost = Vector{T}(undef, nsweeps)
     nkeep = burn < nsweeps ? cld(nsweeps - burn, thin) : 0
@@ -256,7 +310,7 @@ function gibbs(rng::AbstractRNG, data::LatentData{T}, prior::LatentPrior{T};
     saved = 0
     for it in 1:nsweeps
         gibbs_step!(rng, data, state, prior; pcache)
-        postprocess && canonicalize!(state, v)
+        postprocess && canonicalize!(state, V)
         cache = covcache(state.model)
         loglik[it] = latent_loglik(data, state.model; cache)
         logpost[it] = complete_logpost(data, state, prior; cache, pcache)

@@ -3,7 +3,7 @@ include("simulate_data.jl")
 
 gr()
 
-function recovery_plot(β_true, β_hat, t_true, t_chain; path = "regression_recovery.png", accept_β = NaN, accept_t = NaN)
+function recovery_plot(β_true, β_hat, t_true, t_chain; path = "regression_recovery.png")
     plt = plot(layout = (1, 2), size = (1100, 420), legend = false)
 
     xr = extrema(vcat(β_true, β_hat))
@@ -44,17 +44,18 @@ function main()
         Uniform(T(0), T(1)),
     )
     sim = simulate_dataset(rng, config; stem = "regression_recovery_bundle")
-    fit = mala(rng, sim.bundle.regression_model, sim.bundle.supervised_data;
-               nsweeps = 4_000, burn = 1_000, thin = 4,
-               step_β = 0.20, step_t = 0.80, save_chain = true)
+    fit = hmc(rng, sim.bundle.regression_model, sim.bundle.supervised_data;
+              nsweeps = 4_000, n_adapts = 1_000, burn = 1_000, thin = 4,
+              target_accept = 0.85, max_depth = 10, save_chain = true)
     β_hat = vec(mean(fit.β_chain, dims = 1))
     plot_path = recovery_plot(sim.bundle.regression_truth.β, β_hat, sim.bundle.regression_truth.t, fit.t_chain;
-                              path = "regression_recovery.png", accept_β = fit.accept_β, accept_t = fit.accept_t)
+                              path = "regression_recovery.png")
     println("saved recovery plot: ", abspath(plot_path))
     println("saved bundle (.jls): ", abspath(sim.paths.jls_path))
     println("posterior mean t: ", round(mean(fit.t_chain), digits = 4))
     println("true t: ", round(sim.bundle.regression_truth.t, digits = 4))
-    println("acceptance: beta=", round(fit.accept_β, digits = 3), ", t=", round(fit.accept_t, digits = 3))
+    println("mean acceptance: ", round(fit.mean_acceptance, digits = 3))
+    println("divergence rate: ", round(fit.divergence_rate, digits = 3))
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
