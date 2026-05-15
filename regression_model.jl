@@ -145,12 +145,15 @@ end
 
 function mala(rng::AbstractRNG, model::RegressionModel, data::SupervisedData;
               nsweeps = 1_000, burn = 0, thin = 1, init_β = zeros(size(data.cluster_a_μ, 2)),
-              init_t = 0.5, step_β = 0.05, step_t = 0.1, save_states = false)
+              init_t = 0.5, step_β = 0.05, step_t = 0.1, save_states = false, save_chain = true)
     state = mala_state(model, data, init_β, init_t)
     loglik = Vector{Float64}(undef, nsweeps)
     logpost = Vector{Float64}(undef, nsweeps)
+    t_trace = Vector{Float64}(undef, nsweeps)
     nkeep = burn < nsweeps ? cld(nsweeps - burn, thin) : 0
     states = save_states ? Vector{MALAState{Float64}}(undef, nkeep) : nothing
+    β_chain = save_chain ? Matrix{Float64}(undef, nkeep, length(state.β)) : nothing
+    t_chain = save_chain ? Vector{Float64}(undef, nkeep) : nothing
     saved = 0
     acc_β = 0
     acc_t = 0
@@ -159,10 +162,16 @@ function mala(rng::AbstractRNG, model::RegressionModel, data::SupervisedData;
         acc_t += mala_step_t!(rng, model, data, state; step = step_t)
         loglik[it] = state.loglik
         logpost[it] = state.logpost
+        t_trace[it] = t(state)
         if save_states && it > burn && (it - burn) % thin == 0
             saved += 1
             states[saved] = snapshot(state)
+            save_chain && (β_chain[saved, :] .= state.β; t_chain[saved] = t(state))
+        elseif save_chain && it > burn && (it - burn) % thin == 0
+            saved += 1
+            β_chain[saved, :] .= state.β
+            t_chain[saved] = t(state)
         end
     end
-    (; state, loglik, logpost, states, accept_β = acc_β / nsweeps, accept_t = acc_t / nsweeps)
+    (; state, loglik, logpost, t_trace, states, β_chain, t_chain, accept_β = acc_β / nsweeps, accept_t = acc_t / nsweeps)
 end
