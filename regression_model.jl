@@ -174,6 +174,68 @@ end
 
 statfield(stat, name::Symbol, default) = hasproperty(stat, name) ? getproperty(stat, name) : default
 
+function push_hmc_stats!(accept::Vector{Float64}, tree_depth::Vector{Int},
+                         numerical_error::BitVector, transition)
+    stat = transition.stat
+    push!(accept, Float64(statfield(stat, :acceptance_rate, NaN)))
+    push!(tree_depth, Int(statfield(stat, :tree_depth, 0)))
+    push!(numerical_error, Bool(statfield(stat, :numerical_error, false)))
+    nothing
+end
+
+function run_hmc_steps(rng::AbstractRNG, density_model, sampler, θ0::AbstractVector;
+                       nsteps::Int, n_adapts::Int, progress::Bool, verbose::Bool)
+    accept = Float64[]
+    tree_depth = Int[]
+    numerical_error = BitVector()
+    with_logger(NullLogger()) do
+        transition, hmc_state = AdvancedHMC.AbstractMCMC.step(
+            rng,
+            density_model,
+            sampler;
+            initial_params = θ0,
+            n_adapts,
+            progress,
+            verbose,
+        )
+        push_hmc_stats!(accept, tree_depth, numerical_error, transition)
+        for _ in 2:nsteps
+            transition, hmc_state = AdvancedHMC.AbstractMCMC.step(
+                rng,
+                density_model,
+                sampler,
+                hmc_state;
+                n_adapts,
+                progress,
+                verbose,
+            )
+            push_hmc_stats!(accept, tree_depth, numerical_error, transition)
+        end
+        (; transition, hmc_state, accept, tree_depth, numerical_error)
+    end
+end
+
+function inverse_metric_diag(metric, dim::Int)
+    Minv = getproperty(metric, Symbol("M⁻¹"))
+    if Minv isa UniformScaling
+        fill(Float64(Minv.λ), dim)
+    elseif Minv isa AbstractVector
+        collect(Float64, Minv)
+    elseif Minv isa AbstractMatrix
+        collect(Float64, diag(Minv))
+    else
+        error("Unsupported metric inverse type: $(typeof(Minv)).")
+    end
+end
+
+function gamma_density_model(model::GammaRegressionModel, data::SupervisedData, active::AbstractVector{Int})
+    target = GammaActiveTarget(model.β_prior,
+                               Matrix(data.cluster_a_μ[:, active]),
+                               Matrix(data.cluster_b_μ[:, active]),
+                               data.y)
+    AdvancedHMC.LogDensityModel(LogDensityProblemsAD.ADgradient(Val(:Zygote), target))
+end
+
 function gamma_hmc_state(model::GammaRegressionModel, data::SupervisedData, β::AbstractVector, gamma::BitVector, u::Real)
     tt = sigmoid(u)
     GammaRegressionHMCState(collect(float.(β)), copy(gamma),
@@ -207,61 +269,81 @@ function sample_gamma!(rng::AbstractRNG, model::GammaRegressionModel, data::Supe
     prob_on
 end
 
+function gamma_initial_warmup!(rng::AbstractRNG, model::GammaRegressionModel, data::SupervisedData,
+                               β::Vector{Float64}, u::Float64;
+                               nsteps = 300, n_adapts = min(250, nsteps - 1),
+                               target_accept = 0.8, max_depth = 10,
+                               progress = false, verbose = false)
+    p = length(β)
+    active = collect(1:p)
+    density_model = gamma_density_model(model, data, active)
+    sampler = NUTS(target_accept; max_depth)
+    θ0 = vcat(β, u)
+    draws = run_hmc_steps(rng, density_model, sampler, θ0;
+                          nsteps, n_adapts, progress, verbose)
+
+    θ = draws.transition.z.θ
+    β .= θ[1:p]
+    post = min(n_adapts + 1, nsteps):nsteps
+    metric_diag = inverse_metric_diag(AdvancedHMC.getmetric(draws.hmc_state), p + 1)
+    step_size = Float64(AdvancedHMC.step_size(AdvancedHMC.getintegrator(draws.hmc_state)))
+    (; u = Float64(θ[p + 1]),
+       metric_diag,
+       step_size,
+       accept = mean(draws.accept[post]),
+       tree_depth = draws.tree_depth[end],
+       numerical_error = any(draws.numerical_error[post]))
+end
+
 function gamma_hmc_chunk!(rng::AbstractRNG, model::GammaRegressionModel, data::SupervisedData,
                           β::Vector{Float64}, gamma::BitVector, u::Float64;
                           nsteps = 5, n_adapts = 0, target_accept = 0.8, max_depth = 10,
+                          base_metric_diag = nothing, base_step_size = nothing,
                           progress = false, verbose = false)
     active = findall(gamma)
-    target = GammaActiveTarget(model.β_prior,
-                               Matrix(data.cluster_a_μ[:, active]),
-                               Matrix(data.cluster_b_μ[:, active]),
-                               data.y)
-    density_model = AdvancedHMC.LogDensityModel(LogDensityProblemsAD.ADgradient(Val(:Zygote), target))
-    sampler = NUTS(target_accept; max_depth)
+    density_model = gamma_density_model(model, data, active)
+    if base_metric_diag === nothing
+        sampler = NUTS(target_accept; max_depth)
+    else
+        p = length(β)
+        θ_index = vcat(active, p + 1)
+        metric = AdvancedHMC.DiagEuclideanMetric(collect(Float64, base_metric_diag[θ_index]))
+        integrator = base_step_size === nothing ? :leapfrog : AdvancedHMC.Leapfrog(Float64(base_step_size))
+        sampler = NUTS(target_accept; max_depth, metric, integrator)
+    end
     θ0 = vcat(β[active], u)
-    draws = with_logger(NullLogger()) do
-        AdvancedHMC.AbstractMCMC.sample(
-            rng,
-            density_model,
-            sampler,
-            nsteps;
-            n_adapts,
-            initial_params = θ0,
-            progress,
-            verbose,
-        )
-    end
+    draws = run_hmc_steps(rng, density_model, sampler, θ0;
+                          nsteps, n_adapts, progress, verbose)
 
-    accept = Float64[]
-    tree_depth = Int[]
-    numerical_error = Bool[]
-    for draw in draws
-        stat = draw.stat
-        push!(accept, Float64(statfield(stat, :acceptance_rate, NaN)))
-        push!(tree_depth, Int(statfield(stat, :tree_depth, 0)))
-        push!(numerical_error, Bool(statfield(stat, :numerical_error, false)))
-    end
-
-    θ = draws[end].z.θ
+    θ = draws.transition.z.θ
     β[active] .= θ[1:length(active)]
     post = min(n_adapts + 1, nsteps):nsteps
     (; u = Float64(θ[length(active) + 1]),
-       accept = mean(accept[post]),
-       tree_depth = tree_depth[end],
-       numerical_error = any(numerical_error[post]))
+       step_size = Float64(AdvancedHMC.step_size(AdvancedHMC.getintegrator(draws.hmc_state))),
+       accept = mean(draws.accept[post]),
+       tree_depth = draws.tree_depth[end],
+       numerical_error = any(draws.numerical_error[post]))
 end
 
 function gamma_hmc(rng::AbstractRNG, model::GammaRegressionModel, data::SupervisedData;
-                   nsamples = 500, initial_hmc = 100, hmc_steps_per_gamma = 5,
-                   hmc_adapts_per_gamma = 0,
+                   nsamples = 500, initial_hmc = 300,
+                   initial_adapts = min(250, initial_hmc - 1),
+                   hmc_steps_per_gamma = 5, hmc_adapts_per_gamma = 0,
+                   reuse_initial_metric = true,
+                   step_size_adapt_rate = 0.0,
+                   step_size_min_factor = 0.25,
+                   step_size_max_factor = 2.0,
                    init_β = zeros(size(data.cluster_a_μ, 2)), init_gamma = trues(size(data.cluster_a_μ, 2)),
                    init_t = 0.5, target_accept = 0.8, max_depth = 10, save_states = false,
                    save_chain = true, progress = false, verbose = false)
     0.0 < init_t < 1.0 || error("Initial t must lie strictly inside (0, 1).")
     nsamples >= 1 || error("nsamples must be positive.")
     initial_hmc >= 1 || error("initial_hmc must be positive.")
+    0 <= initial_adapts < initial_hmc || error("initial_adapts must satisfy 0 <= initial_adapts < initial_hmc.")
     hmc_steps_per_gamma >= 1 || error("hmc_steps_per_gamma must be positive.")
     0 <= hmc_adapts_per_gamma < hmc_steps_per_gamma || error("hmc_adapts_per_gamma must satisfy 0 <= hmc_adapts_per_gamma < hmc_steps_per_gamma.")
+    step_size_adapt_rate >= 0 || error("step_size_adapt_rate must be non-negative.")
+    0 < step_size_min_factor <= step_size_max_factor || error("Require 0 < step_size_min_factor <= step_size_max_factor.")
     p = size(data.cluster_a_μ, 2)
     length(init_β) == p || error("Expected init_β to have length $p, got $(length(init_β)).")
     length(init_gamma) == p || error("Expected init_gamma to have length $p, got $(length(init_gamma)).")
@@ -269,15 +351,23 @@ function gamma_hmc(rng::AbstractRNG, model::GammaRegressionModel, data::Supervis
     β = collect(Float64, init_β)
     gamma = BitVector(init_gamma)
     u = logit(float(init_t))
-    warm = gamma_hmc_chunk!(rng, model, data, β, gamma, u;
-                            nsteps = initial_hmc, n_adapts = min(div(initial_hmc, 2), initial_hmc - 1),
-                            target_accept, max_depth, progress, verbose)
+    gamma .= true
+    warm = gamma_initial_warmup!(rng, model, data, β, u;
+                                 nsteps = initial_hmc, n_adapts = initial_adapts,
+                                 target_accept, max_depth, progress, verbose)
     u = warm.u
+    gamma .= init_gamma
+    base_metric_diag = reuse_initial_metric ? warm.metric_diag : nothing
+    base_step_size = reuse_initial_metric ? warm.step_size : nothing
+    adaptive_step_size = base_step_size
+    min_step_size = base_step_size === nothing ? nothing : step_size_min_factor * base_step_size
+    max_step_size = base_step_size === nothing ? nothing : step_size_max_factor * base_step_size
 
     loglik = Vector{Float64}(undef, nsamples)
     logpost = Vector{Float64}(undef, nsamples)
     t_trace = Vector{Float64}(undef, nsamples)
     accept_trace = Vector{Float64}(undef, nsamples)
+    step_size_trace = Vector{Float64}(undef, nsamples)
     tree_depth = Vector{Int}(undef, nsamples)
     numerical_error = BitVector(undef, nsamples)
     gamma_index = Vector{Int}(undef, nsamples)
@@ -294,13 +384,19 @@ function gamma_hmc(rng::AbstractRNG, model::GammaRegressionModel, data::Supervis
         gamma_prob[it] = sample_gamma!(rng, model, data, β, gamma, u, j)
         hmc_stats = gamma_hmc_chunk!(rng, model, data, β, gamma, u;
                                      nsteps = hmc_steps_per_gamma, n_adapts = hmc_adapts_per_gamma,
-                                     target_accept, max_depth, progress, verbose)
+                                     target_accept, max_depth, base_metric_diag, base_step_size = adaptive_step_size,
+                                     progress, verbose)
         u = hmc_stats.u
+        if adaptive_step_size !== nothing && step_size_adapt_rate > 0
+            adaptive_step_size = clamp(adaptive_step_size * exp(step_size_adapt_rate * (hmc_stats.accept - target_accept)),
+                                       min_step_size, max_step_size)
+        end
         tt = sigmoid(u)
         loglik[it] = ℓ_likelihood(data, β, gamma, tt)
         logpost[it] = ℓ_posterior(model, data, β, gamma, tt)
         t_trace[it] = tt
         accept_trace[it] = hmc_stats.accept
+        step_size_trace[it] = hmc_stats.step_size
         tree_depth[it] = hmc_stats.tree_depth
         numerical_error[it] = hmc_stats.numerical_error
         active_trace[it] = count(gamma)
@@ -316,9 +412,14 @@ function gamma_hmc(rng::AbstractRNG, model::GammaRegressionModel, data::Supervis
 
     state = gamma_hmc_state(model, data, β, gamma, u)
     (; state, loglik, logpost, t_trace, states, β_chain, gamma_chain, t_chain,
-       gamma_index, gamma_prob, accept_trace, tree_depth, numerical_error,
+       gamma_index, gamma_prob, accept_trace, step_size_trace, tree_depth, numerical_error,
+       initial_metric_diag = warm.metric_diag,
+       initial_step_size = warm.step_size,
+       warmup_acceptance = warm.accept,
+       warmup_numerical_error = warm.numerical_error,
        mean_acceptance = mean(accept_trace),
        divergence_rate = mean(Float64.(numerical_error)),
+       mean_step_size = mean(step_size_trace),
        mean_tree_depth = mean(Float64.(tree_depth)),
        active_trace)
 end

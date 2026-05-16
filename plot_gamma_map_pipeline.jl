@@ -103,8 +103,9 @@ function main()
     map_supervised = supervised_from_map(sim.bundle.latent_data, map_state, sim.bundle.supervised_data.y)
 
     reg_fit = gamma_hmc(rng, sim.bundle.regression_model, map_supervised;
-                        nsamples = 500, initial_hmc = 100, hmc_steps_per_gamma = 5,
-                        hmc_adapts_per_gamma = 4,
+                        nsamples = 500, initial_hmc = 300, initial_adapts = 250,
+                        hmc_steps_per_gamma = 5, hmc_adapts_per_gamma = 0,
+                        reuse_initial_metric = true, step_size_adapt_rate = 0.02,
                         init_gamma = trues(p), init_t = 0.5,
                         target_accept = 0.95, max_depth = 10, save_chain = true)
 
@@ -120,6 +121,8 @@ function main()
     println("true active betas: ", count(sim.bundle.regression_truth.gamma), "/", p)
     println("posterior mean active betas: ", round(mean(reg_fit.active_trace), digits = 2))
     println("gamma recovery [P(s0|t0) P(s1|t0); P(s0|t1) P(s1|t1)]: ", round.(G; digits = 3))
+    println("initial step size: ", round(reg_fit.initial_step_size, digits = 5))
+    println("mean chunk step size: ", round(reg_fit.mean_step_size, digits = 5))
     println("mean acceptance: ", round(reg_fit.mean_acceptance, digits = 3))
     println("divergence rate: ", round(reg_fit.divergence_rate, digits = 3))
 end
