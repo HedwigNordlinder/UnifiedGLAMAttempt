@@ -48,9 +48,9 @@ regression_data = "map"
 
 [regression_mcmc]
 model = "auto"
-nsamples = 200
-initial_hmc = 100
-initial_adapts = 10
+nsamples = 400
+initial_hmc = 200
+initial_adapts = 100
 hmc_steps_per_gamma = 5
 hmc_adapts_per_gamma = 4
 reuse_initial_metric = true

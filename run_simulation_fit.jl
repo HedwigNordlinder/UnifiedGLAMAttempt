@@ -422,11 +422,16 @@ function run_engine(parameter_file::AbstractString)
     reg_fit = run_regression(rng, params, reg_model, fit_data)
     phase_log(run_progress, "regression complete: mean_acceptance=$(round(reg_fit.mean_acceptance; digits=3)) divergence_rate=$(round(reg_fit.divergence_rate; digits=3))")
 
-    alloc_payload = (; fit = alloc_fit, keep_iterations = keep_iters,
+    alloc_payload = (; fit = alloc_fit,
+                     logpost_trace = alloc_fit.logpost,
+                     keep_iterations = keep_iters,
                      config = section(params, "allocation_mcmc"),
                      summary = allocation_summary(alloc_fit, keep_iters))
     fit_data_payload = (; supervised_data = fit_data, metadata = fit_data_meta)
-    reg_payload = (; fit = reg_fit, model = reg_model, fit_data_metadata = fit_data_meta,
+    reg_payload = (; fit = reg_fit,
+                   logpost_trace = reg_fit.logpost,
+                   model = reg_model,
+                   fit_data_metadata = fit_data_meta,
                    config = section(params, "regression_mcmc"),
                    summary = regression_summary(reg_fit, sim_out.bundle.regression_truth))
 
