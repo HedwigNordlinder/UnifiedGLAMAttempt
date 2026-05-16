@@ -43,12 +43,17 @@ postprocess = true
 progress = true
 progress_every = 10
 
+[plotting]
+burn_in = 0
+allocation_burn_in = 50
+regression_burn_in = 200
+
 [fitting]
 regression_data = "map"
 
 [regression_mcmc]
 model = "auto"
-nsamples = 400
+nsamples = 200
 initial_hmc = 200
 initial_adapts = 100
 hmc_steps_per_gamma = 5

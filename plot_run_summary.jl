@@ -8,7 +8,7 @@ gr()
 function usage()
     """
     Usage:
-      julia --project=. --startup-file=no plot_run_summary.jl PARAMS.toml RUN_OR_CHAIN.jls... [--out-prefix OUT]
+      julia --project=. --startup-file=no plot_run_summary.jl PARAMS.toml RUN_OR_CHAIN.jls... [--out-prefix OUT] [--burn-in N]
 
     Inputs:
       - one TOML parameter file
@@ -17,19 +17,46 @@ function usage()
     Outputs:
       - OUT.pdf with allocation and regression log-posterior traces
       - OUT.txt with trace validation and gamma feature-identification summaries
+
+    Burn-in:
+      --burn-in N applies to both allocation and regression traces.
+      --allocation-burn-in N and --regression-burn-in N override it separately.
+      Equivalent TOML defaults can be set under [plotting].
     """
+end
+
+function parse_nonnegative_int(value, name::AbstractString)
+    n = tryparse(Int, String(value))
+    n === nothing && error("$name must be a non-negative integer, got $(repr(value)).")
+    n >= 0 || error("$name must be non-negative, got $n.")
+    n
 end
 
 function parse_args(args)
     toml_files = String[]
     jls_files = String[]
     out_prefix = nothing
+    burn_in = nothing
+    allocation_burn_in = nothing
+    regression_burn_in = nothing
     i = 1
     while i <= length(args)
         arg = args[i]
         if arg == "--out-prefix"
             i < length(args) || error("--out-prefix requires a value.")
             out_prefix = args[i + 1]
+            i += 2
+        elseif arg in ("--burn-in", "--burn")
+            i < length(args) || error("$arg requires a value.")
+            burn_in = parse_nonnegative_int(args[i + 1], arg)
+            i += 2
+        elseif arg in ("--allocation-burn-in", "--alloc-burn-in")
+            i < length(args) || error("$arg requires a value.")
+            allocation_burn_in = parse_nonnegative_int(args[i + 1], arg)
+            i += 2
+        elseif arg in ("--regression-burn-in", "--reg-burn-in")
+            i < length(args) || error("$arg requires a value.")
+            regression_burn_in = parse_nonnegative_int(args[i + 1], arg)
             i += 2
         elseif endswith(lowercase(arg), ".toml")
             push!(toml_files, arg)
@@ -47,7 +74,8 @@ function parse_args(args)
     !isempty(toml_files) || error("Pass one TOML parameter file.\n$(usage())")
     !isempty(jls_files) || error("Pass at least one .jls file.\n$(usage())")
     length(toml_files) == 1 || error("Pass exactly one TOML parameter file.")
-    (; toml_file = toml_files[1], jls_files, out_prefix)
+    (; toml_file = toml_files[1], jls_files, out_prefix,
+       burn_in, allocation_burn_in, regression_burn_in)
 end
 
 has_field(x, key::Symbol) = hasproperty(x, key)
@@ -127,6 +155,32 @@ function logpost_trace(payload, label::AbstractString)
     collect(Float64, trace)
 end
 
+function toml_int(table, key::AbstractString, default)
+    haskey(table, key) || return default
+    value = table[key]
+    value isa Integer || error("plotting.$key must be an integer, got $(repr(value)).")
+    value >= 0 || error("plotting.$key must be non-negative, got $value.")
+    Int(value)
+end
+
+function burn_settings(args, params)
+    plotting = get(params, "plotting", Dict{String,Any}())
+    default_burn = args.burn_in === nothing ? toml_int(plotting, "burn_in", 0) : args.burn_in
+    alloc_burn = args.allocation_burn_in === nothing ? toml_int(plotting, "allocation_burn_in", default_burn) : args.allocation_burn_in
+    reg_burn = args.regression_burn_in === nothing ? toml_int(plotting, "regression_burn_in", default_burn) : args.regression_burn_in
+    (; allocation = alloc_burn, regression = reg_burn)
+end
+
+function discard_burn(trace::AbstractVector, burn::Int, label::AbstractString)
+    burn < length(trace) || error("$label burn-in $burn discards all $(length(trace)) samples.")
+    collect(trace[(burn + 1):end])
+end
+
+function discard_burn_rows(chain::AbstractMatrix, burn::Int, label::AbstractString)
+    burn < size(chain, 1) || error("$label burn-in $burn discards all $(size(chain, 1)) samples.")
+    chain[(burn + 1):end, :]
+end
+
 function gamma_truth(inputs)
     if inputs.simulation !== nothing && has_field(inputs.simulation, :regression_truth) &&
        has_field(inputs.simulation.regression_truth, :gamma)
@@ -186,9 +240,9 @@ function default_out_prefix(args, inputs, params)
     joinpath(String(outdir), "$(String(prefix))_plot_summary")
 end
 
-function trace_axes!(sp, trace; color, title, ylabel)
+function trace_axes!(sp, trace; color, title, ylabel, burn_in)
     plot!(sp, eachindex(trace), trace; color, lw = 1.3, xlabel = "iteration",
-          ylabel, title, legend = false)
+          ylabel, title = "$title\nburn-in discarded=$burn_in", legend = false)
     hline!(sp, [maximum(trace)]; color = :gray45, ls = :dash, lw = 1.0)
 end
 
@@ -216,19 +270,23 @@ function gamma_pip_axes!(sp, gs)
     hline!(sp, [0.5]; color = :black, ls = :dash, lw = 1.0)
 end
 
-function make_pdf(path, alloc_trace, reg_trace, gs)
+function make_pdf(path, alloc_trace, reg_trace, gs, burns)
     if gs === nothing
         plt = plot(layout = (2, 1), size = (950, 700))
         trace_axes!(plt[1], alloc_trace; color = :purple4,
-                    title = "Allocation log posterior", ylabel = "allocation logpost")
+                    title = "Allocation log posterior", ylabel = "allocation logpost",
+                    burn_in = burns.allocation)
         trace_axes!(plt[2], reg_trace; color = :firebrick3,
-                    title = "Regression log posterior", ylabel = "regression logpost")
+                    title = "Regression log posterior", ylabel = "regression logpost",
+                    burn_in = burns.regression)
     else
         plt = plot(layout = (2, 2), size = (1150, 850))
         trace_axes!(plt[1], alloc_trace; color = :purple4,
-                    title = "Allocation log posterior", ylabel = "allocation logpost")
+                    title = "Allocation log posterior", ylabel = "allocation logpost",
+                    burn_in = burns.allocation)
         trace_axes!(plt[2], reg_trace; color = :firebrick3,
-                    title = "Regression log posterior", ylabel = "regression logpost")
+                    title = "Regression log posterior", ylabel = "regression logpost",
+                    burn_in = burns.regression)
         gamma_heatmap_axes!(plt[3], gs)
         gamma_pip_axes!(plt[4], gs)
     end
@@ -236,7 +294,7 @@ function make_pdf(path, alloc_trace, reg_trace, gs)
     path
 end
 
-function write_text_summary(path, args, inputs, alloc_trace, reg_trace, gs)
+function write_text_summary(path, args, inputs, alloc_trace_raw, reg_trace_raw, alloc_trace, reg_trace, gs, burns)
     open(path, "w") do io
         println(io, "Run Plot Summary")
         println(io, "================")
@@ -255,16 +313,21 @@ function write_text_summary(path, args, inputs, alloc_trace, reg_trace, gs)
         end
 
         println(io)
+        println(io, "Burn-in:")
+        println(io, "  allocation_burn_in: ", burns.allocation)
+        println(io, "  regression_burn_in: ", burns.regression)
+
+        println(io)
         println(io, "Log posterior trace validation:")
-        println(io, "  allocation: present, length=$(length(alloc_trace)), final=$(@sprintf("%.3f", alloc_trace[end])), max=$(@sprintf("%.3f", maximum(alloc_trace)))")
-        println(io, "  regression: present, length=$(length(reg_trace)), final=$(@sprintf("%.3f", reg_trace[end])), max=$(@sprintf("%.3f", maximum(reg_trace)))")
+        println(io, "  allocation: present, raw_length=$(length(alloc_trace_raw)), kept_length=$(length(alloc_trace)), final=$(@sprintf("%.3f", alloc_trace[end])), max=$(@sprintf("%.3f", maximum(alloc_trace)))")
+        println(io, "  regression: present, raw_length=$(length(reg_trace_raw)), kept_length=$(length(reg_trace)), final=$(@sprintf("%.3f", reg_trace[end])), max=$(@sprintf("%.3f", maximum(reg_trace)))")
 
         println(io)
         println(io, "Feature identification:")
         if gs === nothing
             println(io, "  not available: gamma_chain and/or gamma_true was not found.")
         else
-            println(io, "  gamma_samples: ", gs.nsamples)
+            println(io, "  gamma_samples_post_burn: ", gs.nsamples)
             println(io, "  nfeatures: ", gs.nfeatures)
             println(io, "  true_active: ", gs.ntrue_active)
             println(io, "  true_inactive: ", gs.ntrue_inactive)
@@ -286,24 +349,31 @@ function main()
     args = parse_args(ARGS)
     params = TOML.parsefile(args.toml_file)
     inputs = load_inputs(args.jls_files)
+    burns = burn_settings(args, params)
 
-    alloc_trace = logpost_trace(inputs.allocation, "allocation")
-    reg_trace = logpost_trace(inputs.regression, "regression")
+    alloc_trace_raw = logpost_trace(inputs.allocation, "allocation")
+    reg_trace_raw = logpost_trace(inputs.regression, "regression")
+    alloc_trace = discard_burn(alloc_trace_raw, burns.allocation, "allocation")
+    reg_trace = discard_burn(reg_trace_raw, burns.regression, "regression")
 
     gchain = gamma_chain(inputs.regression)
     gtrue = gamma_truth(inputs)
-    gs = (gchain === nothing || gtrue === nothing) ? nothing : gamma_summary(gchain, gtrue)
+    gs = if gchain === nothing || gtrue === nothing
+        nothing
+    else
+        gamma_summary(discard_burn_rows(gchain, burns.regression, "gamma_chain"), gtrue)
+    end
 
     out_prefix = default_out_prefix(args, inputs, params)
     mkpath(dirname(out_prefix))
     pdf_path = abspath("$(out_prefix).pdf")
     txt_path = abspath("$(out_prefix).txt")
 
-    make_pdf(pdf_path, alloc_trace, reg_trace, gs)
-    write_text_summary(txt_path, args, inputs, alloc_trace, reg_trace, gs)
+    make_pdf(pdf_path, alloc_trace, reg_trace, gs, burns)
+    write_text_summary(txt_path, args, inputs, alloc_trace_raw, reg_trace_raw, alloc_trace, reg_trace, gs, burns)
 
-    println("validated allocation logpost trace length: ", length(alloc_trace))
-    println("validated regression logpost trace length: ", length(reg_trace))
+    println("validated allocation logpost trace length: ", length(alloc_trace_raw), " raw, ", length(alloc_trace), " kept")
+    println("validated regression logpost trace length: ", length(reg_trace_raw), " raw, ", length(reg_trace), " kept")
     println("saved plot pdf: ", pdf_path)
     println("saved text summary: ", txt_path)
 end

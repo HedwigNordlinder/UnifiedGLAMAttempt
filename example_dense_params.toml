@@ -56,3 +56,6 @@ save_chain = true
 save_states = false
 progress = true
 progress_every = 5
+
+[plotting]
+burn_in = 0
