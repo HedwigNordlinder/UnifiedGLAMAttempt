@@ -22,6 +22,14 @@ struct RegressionTruth{T<:AbstractFloat}
     p::Vector{T}
 end
 
+struct GammaRegressionTruth{T<:AbstractFloat}
+    β::Vector{T}
+    gamma::BitVector
+    t::T
+    η::Vector{T}
+    p::Vector{T}
+end
+
 function default_simulation_config(p::Int; npatients = 120, nobs_range = 8:20)
     T = Float64
     SimulationConfig(
@@ -95,7 +103,29 @@ function simulate_regression_truth(rng::AbstractRNG, config::SimulationConfig{T}
     SupervisedData(A, B, y), RegressionTruth(β, t, η, q)
 end
 
-function patient_stats(data::LatentData{T}, truth::GibbsState{T}, regtruth::RegressionTruth{T}, supervised::SupervisedData{T}) where {T}
+function simulate_gamma_regression_truth(rng::AbstractRNG, config::SimulationConfig{T}, truth::GibbsState{T};
+                                         gamma_prior = T(0.1), β_prior = Normal(T(0), T(1))) where {T}
+    p = size(truth.model.mu[1], 1)
+    gamma = BitVector(rand(rng, Bernoulli(gamma_prior), p) .== 1)
+    β = zeros(T, p)
+    β[gamma] .= rand(rng, β_prior, count(gamma))
+    t = rand(rng, config.t_prior)
+    η = Vector{T}(undef, length(truth.model.mu))
+    q = similar(η)
+    y = Vector{Int}(undef, length(η))
+    A = Matrix{T}(undef, length(η), p)
+    B = similar(A)
+    for i in eachindex(truth.model.mu)
+        A[i, :] .= truth.model.mu[i][:, 1]
+        B[i, :] .= truth.model.mu[i][:, 2]
+        η[i] = t * dot(β, truth.model.mu[i][:, 1]) + (1 - t) * dot(β, truth.model.mu[i][:, 2])
+        q[i] = sigmoid(η[i])
+        y[i] = rand(rng, Bernoulli(q[i]))
+    end
+    SupervisedData(A, B, y), GammaRegressionTruth(β, gamma, t, η, q)
+end
+
+function patient_stats(data::LatentData{T}, truth::GibbsState{T}, regtruth, supervised::SupervisedData{T}) where {T}
     nobs = [size(Xi, 2) for Xi in data.X]
     realized_share = [mean(zi) for zi in truth.z]
     y = Float64.(supervised.y)
@@ -112,7 +142,7 @@ function patient_stats(data::LatentData{T}, truth::GibbsState{T}, regtruth::Regr
        eta_sd = std(regtruth.η))
 end
 
-function plot_simulation_summary(data::LatentData, truth::GibbsState, regtruth::RegressionTruth, supervised::SupervisedData;
+function plot_simulation_summary(data::LatentData, truth::GibbsState, regtruth, supervised::SupervisedData;
                                  path = "simulation_summary.png")
     stats = patient_stats(data, truth, regtruth, supervised)
     plt = plot(layout = (2, 3), size = (1200, 700), legend = false)
@@ -180,6 +210,29 @@ function simulate_dataset(rng::AbstractRNG, config::SimulationConfig{T}; stem = 
         latent_truth,
         supervised_data,
         regression_model = RegressionModel(config.β_prior),
+        regression_truth,
+        stats,
+        latent_cluster_mean_shift = cluster_mean_shift,
+        latent_cluster_centers = cluster_mean_centers(config.latent_prior, cluster_mean_shift),
+        summary_plot = abspath(plot_path),
+    )
+    paths = save_bundle(bundle; stem)
+    (; bundle, plot_path = abspath(plot_path), paths)
+end
+
+function simulate_gamma_dataset(rng::AbstractRNG, config::SimulationConfig{T}; stem = "gamma_simulation_bundle",
+                                cluster_mean_shift = one(T), gamma_prior = T(0.1),
+                                β_prior = Normal(T(0), T(1))) where {T}
+    latent_data, latent_truth = simulate_latent_truth(rng, config; cluster_mean_shift)
+    supervised_data, regression_truth = simulate_gamma_regression_truth(rng, config, latent_truth; gamma_prior, β_prior)
+    plot_path = plot_simulation_summary(latent_data, latent_truth, regression_truth, supervised_data; path = "$(stem)_summary.png")
+    stats = patient_stats(latent_data, latent_truth, regression_truth, supervised_data)
+    bundle = (;
+        config,
+        latent_data,
+        latent_truth,
+        supervised_data,
+        regression_model = GammaRegressionModel(β_prior, gamma_prior),
         regression_truth,
         stats,
         latent_cluster_mean_shift = cluster_mean_shift,

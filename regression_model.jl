@@ -1,4 +1,4 @@
-using LinearAlgebra, Random, Statistics, Distributions
+using LinearAlgebra, Random, Statistics, Distributions, Logging
 using AdvancedHMC, LogDensityProblems, LogDensityProblemsAD, Zygote
 
 struct SupervisedData{T<:AbstractFloat,Y<:Real}
@@ -12,6 +12,11 @@ SupervisedData(a::Vector{<:AbstractVector{T}}, b::Vector{<:AbstractVector{T}}, y
 
 struct RegressionModel{P<:Distribution}
     β_prior::P
+end
+
+struct GammaRegressionModel{P<:UnivariateDistribution,T<:AbstractFloat}
+    β_prior::P
+    gamma_prior::T
 end
 
 const LOG2PI = log(2 * pi)
@@ -42,6 +47,10 @@ function logits(data::SupervisedData, β::AbstractVector, t::Real)
     t .* (data.cluster_a_μ * β) .+ (1 - t) .* (data.cluster_b_μ * β)
 end
 
+function logits(data::SupervisedData, β::AbstractVector, gamma::AbstractVector{Bool}, t::Real)
+    logits(data, β .* gamma, t)
+end
+
 ℓ_prior(model::RegressionModel, β::AbstractVector) = β_logprior(model.β_prior, β)
 
 function ℓ_likelihood(data::SupervisedData, β::AbstractVector, t::Real)
@@ -55,6 +64,28 @@ end
 
 function ℓ_posterior(model::RegressionModel, data::SupervisedData, β::AbstractVector, t::Real)
     t_logprior(t) + ℓ_prior(model, β) + ℓ_likelihood(data, β, t)
+end
+
+function gamma_logprior(model::GammaRegressionModel, gamma::AbstractVector{Bool})
+    p = clamp(model.gamma_prior, eps(typeof(model.gamma_prior)), one(model.gamma_prior) - eps(typeof(model.gamma_prior)))
+    count(gamma) * log(p) + (length(gamma) - count(gamma)) * log1p(-p)
+end
+
+function ℓ_prior(model::GammaRegressionModel, β::AbstractVector, gamma::AbstractVector{Bool})
+    β_logprior(model.β_prior, β[gamma]) + gamma_logprior(model, gamma)
+end
+
+function ℓ_likelihood(data::SupervisedData, β::AbstractVector, gamma::AbstractVector{Bool}, t::Real)
+    η = logits(data, β, gamma, t)
+    s = zero(promote_type(eltype(η), eltype(data.y)))
+    @inbounds for i in eachindex(η, data.y)
+        s += data.y[i] * logsigmoid(η[i]) + (1 - data.y[i]) * log1msigmoid(η[i])
+    end
+    s
+end
+
+function ℓ_posterior(model::GammaRegressionModel, data::SupervisedData, β::AbstractVector, gamma::AbstractVector{Bool}, t::Real)
+    t_logprior(t) + ℓ_prior(model, β, gamma) + ℓ_likelihood(data, β, gamma, t)
 end
 
 function transformed_logtarget(model::RegressionModel, data::SupervisedData, β::AbstractVector, u::Real)
@@ -71,6 +102,13 @@ struct RegressionTarget{M<:RegressionModel,D<:SupervisedData}
     data::D
 end
 
+struct GammaActiveTarget{P<:UnivariateDistribution,T<:AbstractFloat,Y<:Real}
+    β_prior::P
+    A::Matrix{T}
+    B::Matrix{T}
+    y::Vector{Y}
+end
+
 LogDensityProblems.dimension(target::RegressionTarget) = size(target.data.cluster_a_μ, 2) + 1
 LogDensityProblems.capabilities(::Type{<:RegressionTarget}) = LogDensityProblems.LogDensityOrder{0}()
 
@@ -82,6 +120,23 @@ function LogDensityProblems.logdensity(target::RegressionTarget, θ::AbstractVec
     transformed_logtarget(target.model, target.data, β, u)
 end
 
+LogDensityProblems.dimension(target::GammaActiveTarget) = size(target.A, 2) + 1
+LogDensityProblems.capabilities(::Type{<:GammaActiveTarget}) = LogDensityProblems.LogDensityOrder{0}()
+
+function LogDensityProblems.logdensity(target::GammaActiveTarget, θ::AbstractVector{<:Real})
+    p = size(target.A, 2)
+    length(θ) == p + 1 || error("Expected parameter vector of length $(p + 1), got $(length(θ)).")
+    β = θ[1:p]
+    u = θ[p + 1]
+    tt = sigmoid(u)
+    η = tt .* (target.A * β) .+ (1 - tt) .* (target.B * β)
+    s = β_logprior(target.β_prior, β) + logsigmoid(u) + log1msigmoid(u)
+    @inbounds for i in eachindex(η, target.y)
+        s += target.y[i] * logsigmoid(η[i]) + (1 - target.y[i]) * log1msigmoid(η[i])
+    end
+    s
+end
+
 mutable struct RegressionHMCState{T<:AbstractFloat}
     β::Vector{T}
     u::T
@@ -89,8 +144,19 @@ mutable struct RegressionHMCState{T<:AbstractFloat}
     logpost::T
 end
 
+mutable struct GammaRegressionHMCState{T<:AbstractFloat}
+    β::Vector{T}
+    gamma::BitVector
+    u::T
+    loglik::T
+    logpost::T
+end
+
 t(state::RegressionHMCState) = sigmoid(state.u)
+t(state::GammaRegressionHMCState) = sigmoid(state.u)
 snapshot(state::RegressionHMCState{T}) where {T} = RegressionHMCState(copy(state.β), state.u, state.loglik, state.logpost)
+snapshot(state::GammaRegressionHMCState{T}) where {T} =
+    GammaRegressionHMCState(copy(state.β), copy(state.gamma), state.u, state.loglik, state.logpost)
 
 function hmc_state(model::RegressionModel, data::SupervisedData, θ::AbstractVector)
     p = size(data.cluster_a_μ, 2)
@@ -107,6 +173,155 @@ function regression_logdensity_model(model::RegressionModel, data::SupervisedDat
 end
 
 statfield(stat, name::Symbol, default) = hasproperty(stat, name) ? getproperty(stat, name) : default
+
+function gamma_hmc_state(model::GammaRegressionModel, data::SupervisedData, β::AbstractVector, gamma::BitVector, u::Real)
+    tt = sigmoid(u)
+    GammaRegressionHMCState(collect(float.(β)), copy(gamma),
+                            float(u),
+                            ℓ_likelihood(data, β, gamma, tt),
+                            ℓ_posterior(model, data, β, gamma, tt))
+end
+
+function sample_gamma!(rng::AbstractRNG, model::GammaRegressionModel, data::SupervisedData,
+                       β::AbstractVector, gamma::BitVector, u::Real, j::Int)
+    tt = sigmoid(u)
+    η = logits(data, β, gamma, tt)
+    xj = tt .* view(data.cluster_a_μ, :, j) .+ (1 - tt) .* view(data.cluster_b_μ, :, j)
+    δ = β[j] .* xj
+    η_on = gamma[j] ? η : η .+ δ
+    η_off = gamma[j] ? η .- δ : η
+
+    loglik_on = zero(eltype(η))
+    loglik_off = zero(eltype(η))
+    @inbounds for i in eachindex(η, data.y)
+        y = data.y[i]
+        loglik_on += y * logsigmoid(η_on[i]) + (1 - y) * log1msigmoid(η_on[i])
+        loglik_off += y * logsigmoid(η_off[i]) + (1 - y) * log1msigmoid(η_off[i])
+    end
+
+    pγ = clamp(model.gamma_prior, eps(typeof(model.gamma_prior)), one(model.gamma_prior) - eps(typeof(model.gamma_prior)))
+    log_on = log(pγ) + logpdf(model.β_prior, β[j]) + loglik_on
+    log_off = log1p(-pγ) + loglik_off
+    prob_on = sigmoid(log_on - log_off)
+    gamma[j] = rand(rng) < prob_on
+    prob_on
+end
+
+function gamma_hmc_chunk!(rng::AbstractRNG, model::GammaRegressionModel, data::SupervisedData,
+                          β::Vector{Float64}, gamma::BitVector, u::Float64;
+                          nsteps = 5, n_adapts = 0, target_accept = 0.8, max_depth = 10,
+                          progress = false, verbose = false)
+    active = findall(gamma)
+    target = GammaActiveTarget(model.β_prior,
+                               Matrix(data.cluster_a_μ[:, active]),
+                               Matrix(data.cluster_b_μ[:, active]),
+                               data.y)
+    density_model = AdvancedHMC.LogDensityModel(LogDensityProblemsAD.ADgradient(Val(:Zygote), target))
+    sampler = NUTS(target_accept; max_depth)
+    θ0 = vcat(β[active], u)
+    draws = with_logger(NullLogger()) do
+        AdvancedHMC.AbstractMCMC.sample(
+            rng,
+            density_model,
+            sampler,
+            nsteps;
+            n_adapts,
+            initial_params = θ0,
+            progress,
+            verbose,
+        )
+    end
+
+    accept = Float64[]
+    tree_depth = Int[]
+    numerical_error = Bool[]
+    for draw in draws
+        stat = draw.stat
+        push!(accept, Float64(statfield(stat, :acceptance_rate, NaN)))
+        push!(tree_depth, Int(statfield(stat, :tree_depth, 0)))
+        push!(numerical_error, Bool(statfield(stat, :numerical_error, false)))
+    end
+
+    θ = draws[end].z.θ
+    β[active] .= θ[1:length(active)]
+    post = min(n_adapts + 1, nsteps):nsteps
+    (; u = Float64(θ[length(active) + 1]),
+       accept = mean(accept[post]),
+       tree_depth = tree_depth[end],
+       numerical_error = any(numerical_error[post]))
+end
+
+function gamma_hmc(rng::AbstractRNG, model::GammaRegressionModel, data::SupervisedData;
+                   nsamples = 500, initial_hmc = 100, hmc_steps_per_gamma = 5,
+                   hmc_adapts_per_gamma = 0,
+                   init_β = zeros(size(data.cluster_a_μ, 2)), init_gamma = trues(size(data.cluster_a_μ, 2)),
+                   init_t = 0.5, target_accept = 0.8, max_depth = 10, save_states = false,
+                   save_chain = true, progress = false, verbose = false)
+    0.0 < init_t < 1.0 || error("Initial t must lie strictly inside (0, 1).")
+    nsamples >= 1 || error("nsamples must be positive.")
+    initial_hmc >= 1 || error("initial_hmc must be positive.")
+    hmc_steps_per_gamma >= 1 || error("hmc_steps_per_gamma must be positive.")
+    0 <= hmc_adapts_per_gamma < hmc_steps_per_gamma || error("hmc_adapts_per_gamma must satisfy 0 <= hmc_adapts_per_gamma < hmc_steps_per_gamma.")
+    p = size(data.cluster_a_μ, 2)
+    length(init_β) == p || error("Expected init_β to have length $p, got $(length(init_β)).")
+    length(init_gamma) == p || error("Expected init_gamma to have length $p, got $(length(init_gamma)).")
+
+    β = collect(Float64, init_β)
+    gamma = BitVector(init_gamma)
+    u = logit(float(init_t))
+    warm = gamma_hmc_chunk!(rng, model, data, β, gamma, u;
+                            nsteps = initial_hmc, n_adapts = min(div(initial_hmc, 2), initial_hmc - 1),
+                            target_accept, max_depth, progress, verbose)
+    u = warm.u
+
+    loglik = Vector{Float64}(undef, nsamples)
+    logpost = Vector{Float64}(undef, nsamples)
+    t_trace = Vector{Float64}(undef, nsamples)
+    accept_trace = Vector{Float64}(undef, nsamples)
+    tree_depth = Vector{Int}(undef, nsamples)
+    numerical_error = BitVector(undef, nsamples)
+    gamma_index = Vector{Int}(undef, nsamples)
+    gamma_prob = Vector{Float64}(undef, nsamples)
+    active_trace = Vector{Int}(undef, nsamples)
+    states = save_states ? Vector{GammaRegressionHMCState{Float64}}(undef, nsamples) : nothing
+    β_chain = save_chain ? Matrix{Float64}(undef, nsamples, p) : nothing
+    gamma_chain = save_chain ? BitMatrix(undef, nsamples, p) : nothing
+    t_chain = save_chain ? Vector{Float64}(undef, nsamples) : nothing
+
+    for it in 1:nsamples
+        j = rand(rng, 1:p)
+        gamma_index[it] = j
+        gamma_prob[it] = sample_gamma!(rng, model, data, β, gamma, u, j)
+        hmc_stats = gamma_hmc_chunk!(rng, model, data, β, gamma, u;
+                                     nsteps = hmc_steps_per_gamma, n_adapts = hmc_adapts_per_gamma,
+                                     target_accept, max_depth, progress, verbose)
+        u = hmc_stats.u
+        tt = sigmoid(u)
+        loglik[it] = ℓ_likelihood(data, β, gamma, tt)
+        logpost[it] = ℓ_posterior(model, data, β, gamma, tt)
+        t_trace[it] = tt
+        accept_trace[it] = hmc_stats.accept
+        tree_depth[it] = hmc_stats.tree_depth
+        numerical_error[it] = hmc_stats.numerical_error
+        active_trace[it] = count(gamma)
+        if save_states
+            states[it] = GammaRegressionHMCState(copy(β), copy(gamma), u, loglik[it], logpost[it])
+        end
+        if save_chain
+            β_chain[it, :] .= β
+            gamma_chain[it, :] .= gamma
+            t_chain[it] = tt
+        end
+    end
+
+    state = gamma_hmc_state(model, data, β, gamma, u)
+    (; state, loglik, logpost, t_trace, states, β_chain, gamma_chain, t_chain,
+       gamma_index, gamma_prob, accept_trace, tree_depth, numerical_error,
+       mean_acceptance = mean(accept_trace),
+       divergence_rate = mean(Float64.(numerical_error)),
+       mean_tree_depth = mean(Float64.(tree_depth)),
+       active_trace)
+end
 
 function hmc(rng::AbstractRNG, model::RegressionModel, data::SupervisedData;
              nsweeps = 1_000, n_adapts = min(div(nsweeps, 2), 1_000), burn = n_adapts, thin = 1,
