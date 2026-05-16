@@ -2,3 +2,6 @@ AbstractMCMC.jl
 AdvancedHMC.jl
 TransformVariables.jl
 *.jls
+*.png
+*.pdf
+

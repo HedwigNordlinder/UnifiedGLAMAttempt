@@ -164,6 +164,14 @@ end
 keep_iterations(nsweeps::Int, burn::Int, thin::Int) =
     [it for it in 1:nsweeps if it > burn && (it - burn) % thin == 0]
 
+function artifact_prefix(parameter_file::AbstractString, prefix::AbstractString)
+    parameter_stem = splitext(basename(parameter_file))[1]
+    if prefix == parameter_stem || startswith(prefix, "$(parameter_stem)_")
+        return prefix
+    end
+    "$(parameter_stem)_$(prefix)"
+end
+
 function save_artifact(stem::AbstractString, payload)
     mkpath(dirname(stem))
     jls_path = abspath("$(stem).jls")
@@ -342,6 +350,7 @@ function run_engine(parameter_file::AbstractString)
     seed = as_int(cfgget(run, "seed", 20260516), "run.seed")
     rng = MersenneTwister(seed)
     prefix = as_string(cfgget(run, "prefix", splitext(basename(parameter_file))[1]), "run.prefix")
+    artifact_name_prefix = artifact_prefix(parameter_file, prefix)
     outdir = abspath(as_string(cfgget(run, "output_dir", joinpath("runs", prefix)), "run.output_dir"))
     mkpath(outdir)
     run_progress = as_bool(cfgget(run, "progress", true), "run.progress")
@@ -350,8 +359,8 @@ function run_engine(parameter_file::AbstractString)
     config = build_simulation_config(params, T)
     sim_kind = lower_string(cfgget(sim, "regression", "dense"), "simulation.regression")
     cluster_mean_shift = cfgget(sim, "cluster_mean_shift", 1.0)
-    simulation_stem = joinpath(outdir, "$(prefix)_simulation")
-    phase_log(run_progress, "starting run prefix=$prefix seed=$seed output_dir=$outdir")
+    simulation_stem = joinpath(outdir, "$(artifact_name_prefix)_simulation")
+    phase_log(run_progress, "starting run prefix=$prefix artifact_prefix=$artifact_name_prefix seed=$seed output_dir=$outdir")
     phase_log(run_progress, "simulation: kind=$sim_kind patients=$(config.npatients) p=$(length(config.latent_prior.m0)) nobs=$(first(config.nobs_range)):$(last(config.nobs_range)) cluster_mean_shift=$(cluster_mean_shift)")
 
     sim_out = if sim_kind in ("dense", "standard")
@@ -423,9 +432,9 @@ function run_engine(parameter_file::AbstractString)
 
     paths = (;
         simulation = (; jls_path = abspath(sim_out.paths.jls_path), jld2_path = sim_out.paths.jld2_path),
-        allocation_chain = save_artifact(joinpath(outdir, "$(prefix)_allocation_chain"), alloc_payload),
-        fit_data = save_artifact(joinpath(outdir, "$(prefix)_fit_data"), fit_data_payload),
-        regression_chain = save_artifact(joinpath(outdir, "$(prefix)_regression_chain"), reg_payload),
+        allocation_chain = save_artifact(joinpath(outdir, "$(artifact_name_prefix)_allocation_chain"), alloc_payload),
+        fit_data = save_artifact(joinpath(outdir, "$(artifact_name_prefix)_fit_data"), fit_data_payload),
+        regression_chain = save_artifact(joinpath(outdir, "$(artifact_name_prefix)_regression_chain"), reg_payload),
     )
 
     raw_parameter_file = read(parameter_file, String)
@@ -439,6 +448,7 @@ function run_engine(parameter_file::AbstractString)
             parameter_file = abspath(parameter_file),
             output_dir = outdir,
             prefix,
+            artifact_prefix = artifact_name_prefix,
             seed,
         ),
         parameter_toml = raw_parameter_file,
@@ -458,7 +468,7 @@ function run_engine(parameter_file::AbstractString)
             regression_data = fit_data_meta,
         ),
     )
-    run_paths = save_artifact(joinpath(outdir, "$(prefix)_run"), run_payload)
+    run_paths = save_artifact(joinpath(outdir, "$(artifact_name_prefix)_run"), run_payload)
     phase_log(run_progress, "artifacts saved")
 
     println("saved simulation: ", paths.simulation.jls_path)
