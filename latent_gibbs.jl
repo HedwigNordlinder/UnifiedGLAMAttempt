@@ -1,6 +1,7 @@
 using LinearAlgebra, Random, Statistics, Distributions
 using PDMats: PDMat
 include("glam_stable.jl")
+include("progress_helpers.jl")
 
 struct LatentPrior{T<:AbstractFloat}
     alpha0::T
@@ -297,7 +298,8 @@ end
 
 function gibbs(rng::AbstractRNG, data::LatentData{T}, prior::LatentPrior{T};
                nsweeps = 1_000, burn = 0, thin = 1, init = nothing, save_states = false,
-               postprocess = true, direction = nothing, cluster_mean_shift = zero(T)) where {T}
+               postprocess = true, direction = nothing, cluster_mean_shift = zero(T),
+               progress = false, progress_every = max(1, nsweeps ÷ 100)) where {T}
     state = init === nothing ? init_state(rng, data, prior) : snapshot(init)
     pcache = priorcache(prior; cluster_mean_shift)
     V = direction === nothing ? projection_basis(data) :
@@ -308,6 +310,8 @@ function gibbs(rng::AbstractRNG, data::LatentData{T}, prior::LatentPrior{T};
     nkeep = burn < nsweeps ? cld(nsweeps - burn, thin) : 0
     states = save_states ? Vector{GibbsState{T}}(undef, nkeep) : nothing
     saved = 0
+    prog = SimpleProgress("allocation", nsweeps; enabled = progress, every = progress_every)
+    progress_update!(prog, 0; force = true, suffix = "patients=$(length(data.X)) p=$(size(data.X[1], 1))")
     for it in 1:nsweeps
         gibbs_step!(rng, data, state, prior; pcache)
         postprocess && canonicalize!(state, V)
@@ -318,6 +322,7 @@ function gibbs(rng::AbstractRNG, data::LatentData{T}, prior::LatentPrior{T};
             saved += 1
             states[saved] = snapshot(state)
         end
+        progress_update!(prog, it; suffix = "logpost=$(round(logpost[it]; digits=2)) saved=$saved/$nkeep")
     end
     (; state, loglik, logpost, states)
 end

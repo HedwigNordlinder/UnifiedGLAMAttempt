@@ -1,0 +1,58 @@
+[run]
+seed = 20260516
+prefix = "example_dense"
+output_dir = "runs/example_dense"
+progress = true
+
+[simulation]
+regression = "dense"
+p = 8
+npatients = 35
+nobs_range = [5, 8]
+cluster_mean_shift = 1.0
+
+[latent_prior]
+alpha0 = 2.0
+beta0 = 2.0
+lambda0_scale = 2.0
+a0 = 2.0
+b0 = 2.0
+nu0_offset = 3.0
+S0_scale = 1.0
+m0 = 0.0
+
+[beta_prior]
+dist = "normal"
+mean = 0.0
+sd = 0.5
+
+[t_prior]
+dist = "uniform"
+low = 0.0
+high = 1.0
+
+[allocation_mcmc]
+nsweeps = 20
+burn = 0
+thin = 1
+save_states = true
+postprocess = true
+progress = true
+progress_every = 2
+
+[fitting]
+regression_data = "map"
+
+[regression_mcmc]
+model = "auto"
+nsweeps = 60
+n_adapts = 30
+burn = 30
+thin = 2
+init_t = 0.5
+target_accept = 0.9
+max_depth = 8
+save_chain = true
+save_states = false
+progress = true
+progress_every = 5

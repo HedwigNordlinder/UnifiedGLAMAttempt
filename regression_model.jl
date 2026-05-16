@@ -1,5 +1,6 @@
 using LinearAlgebra, Random, Statistics, Distributions, Logging
 using AdvancedHMC, LogDensityProblems, LogDensityProblemsAD, Zygote
+include("progress_helpers.jl")
 
 struct SupervisedData{T<:AbstractFloat,Y<:Real}
     cluster_a_μ::Matrix{T}   # n x p
@@ -184,10 +185,16 @@ function push_hmc_stats!(accept::Vector{Float64}, tree_depth::Vector{Int},
 end
 
 function run_hmc_steps(rng::AbstractRNG, density_model, sampler, θ0::AbstractVector;
-                       nsteps::Int, n_adapts::Int, progress::Bool, verbose::Bool)
+                       nsteps::Int, n_adapts::Int, progress::Bool, verbose::Bool,
+                       progress_label::AbstractString = "",
+                       progress_every::Int = max(1, nsteps ÷ 100),
+                       save_transitions::Bool = false)
     accept = Float64[]
     tree_depth = Int[]
     numerical_error = BitVector()
+    transitions = save_transitions ? Vector{Any}(undef, nsteps) : nothing
+    prog = SimpleProgress(progress_label, nsteps; enabled = progress && !isempty(progress_label), every = progress_every)
+    progress_update!(prog, 0; force = true)
     with_logger(NullLogger()) do
         transition, hmc_state = AdvancedHMC.AbstractMCMC.step(
             rng,
@@ -199,6 +206,8 @@ function run_hmc_steps(rng::AbstractRNG, density_model, sampler, θ0::AbstractVe
             verbose,
         )
         push_hmc_stats!(accept, tree_depth, numerical_error, transition)
+        save_transitions && (transitions[1] = transition)
+        progress_update!(prog, 1; suffix = "accept=$(round(accept[end]; digits=3)) depth=$(tree_depth[end])")
         for _ in 2:nsteps
             transition, hmc_state = AdvancedHMC.AbstractMCMC.step(
                 rng,
@@ -210,8 +219,11 @@ function run_hmc_steps(rng::AbstractRNG, density_model, sampler, θ0::AbstractVe
                 verbose,
             )
             push_hmc_stats!(accept, tree_depth, numerical_error, transition)
+            i = length(accept)
+            save_transitions && (transitions[i] = transition)
+            progress_update!(prog, i; suffix = "accept=$(round(accept[end]; digits=3)) depth=$(tree_depth[end])")
         end
-        (; transition, hmc_state, accept, tree_depth, numerical_error)
+        (; transition, hmc_state, accept, tree_depth, numerical_error, transitions)
     end
 end
 
@@ -335,7 +347,8 @@ function gamma_hmc(rng::AbstractRNG, model::GammaRegressionModel, data::Supervis
                    step_size_max_factor = 2.0,
                    init_β = zeros(size(data.cluster_a_μ, 2)), init_gamma = trues(size(data.cluster_a_μ, 2)),
                    init_t = 0.5, target_accept = 0.8, max_depth = 10, save_states = false,
-                   save_chain = true, progress = false, verbose = false)
+                   save_chain = true, progress = false, verbose = false,
+                   progress_every = max(1, nsamples ÷ 100))
     0.0 < init_t < 1.0 || error("Initial t must lie strictly inside (0, 1).")
     nsamples >= 1 || error("nsamples must be positive.")
     initial_hmc >= 1 || error("initial_hmc must be positive.")
@@ -352,6 +365,10 @@ function gamma_hmc(rng::AbstractRNG, model::GammaRegressionModel, data::Supervis
     gamma = BitVector(init_gamma)
     u = logit(float(init_t))
     gamma .= true
+    if progress
+        println("gamma regression warmup: all gammas on, initial_hmc=$initial_hmc, initial_adapts=$initial_adapts")
+        flush(stdout)
+    end
     warm = gamma_initial_warmup!(rng, model, data, β, u;
                                  nsteps = initial_hmc, n_adapts = initial_adapts,
                                  target_accept, max_depth, progress, verbose)
@@ -377,6 +394,8 @@ function gamma_hmc(rng::AbstractRNG, model::GammaRegressionModel, data::Supervis
     β_chain = save_chain ? Matrix{Float64}(undef, nsamples, p) : nothing
     gamma_chain = save_chain ? BitMatrix(undef, nsamples, p) : nothing
     t_chain = save_chain ? Vector{Float64}(undef, nsamples) : nothing
+    prog = SimpleProgress("gamma regression", nsamples; enabled = progress, every = progress_every)
+    progress_update!(prog, 0; force = true, suffix = "p=$p hmc_steps_per_gamma=$hmc_steps_per_gamma")
 
     for it in 1:nsamples
         j = rand(rng, 1:p)
@@ -400,6 +419,7 @@ function gamma_hmc(rng::AbstractRNG, model::GammaRegressionModel, data::Supervis
         tree_depth[it] = hmc_stats.tree_depth
         numerical_error[it] = hmc_stats.numerical_error
         active_trace[it] = count(gamma)
+        progress_update!(prog, it; suffix = "t=$(round(tt; digits=3)) active=$(active_trace[it]) accept=$(round(accept_trace[it]; digits=3))")
         if save_states
             states[it] = GammaRegressionHMCState(copy(β), copy(gamma), u, loglik[it], logpost[it])
         end
@@ -428,7 +448,7 @@ function hmc(rng::AbstractRNG, model::RegressionModel, data::SupervisedData;
              nsweeps = 1_000, n_adapts = min(div(nsweeps, 2), 1_000), burn = n_adapts, thin = 1,
              init_β = zeros(size(data.cluster_a_μ, 2)), init_t = 0.5,
              target_accept = 0.8, max_depth = 10, save_states = false, save_chain = true,
-             progress = false, verbose = false)
+             progress = false, verbose = false, progress_every = max(1, nsweeps ÷ 100))
     0.0 < init_t < 1.0 || error("Initial t must lie strictly inside (0, 1).")
     1 <= nsweeps || error("nsweeps must be positive.")
     0 <= n_adapts < nsweeps || error("n_adapts must satisfy 0 <= n_adapts < nsweeps.")
@@ -441,16 +461,13 @@ function hmc(rng::AbstractRNG, model::RegressionModel, data::SupervisedData;
     density_model = regression_logdensity_model(model, data)
     sampler = NUTS(target_accept; max_depth = max_depth)
     θ0 = vcat(collect(float.(init_β)), logit(float(init_t)))
-    draws = AdvancedHMC.AbstractMCMC.sample(
-        rng,
-        density_model,
-        sampler,
-        nsweeps;
-        n_adapts = n_adapts,
-        initial_params = θ0,
-        progress = progress,
-        verbose = verbose,
-    )
+    hmc_run = run_hmc_steps(rng, density_model, sampler, θ0;
+                            nsteps = nsweeps, n_adapts,
+                            progress, verbose,
+                            progress_label = "dense regression",
+                            progress_every,
+                            save_transitions = true)
+    draws = hmc_run.transitions
 
     loglik = Vector{Float64}(undef, nsweeps)
     logpost = Vector{Float64}(undef, nsweeps)
