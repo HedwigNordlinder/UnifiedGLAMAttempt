@@ -73,6 +73,15 @@ function rand_precision_normal(rng, Q, b)
     (F \ b) + (F.U \ randn(rng, length(b)))
 end
 
+function rand_precision_normal!(rng, dest::AbstractVector, Q::AbstractMatrix, b::AbstractVector, noise::AbstractVector)
+    F = cholesky!(Hermitian(Q))
+    ldiv!(dest, F, b)
+    randn!(rng, noise)
+    ldiv!(F.U, noise)
+    dest .+= noise
+    dest
+end
+
 function init_state(rng::AbstractRNG, data::LatentData{T}, prior::LatentPrior{T}) where {T}
     Xall = reduce(hcat, data.X)
     p = size(Xall, 1)
@@ -193,14 +202,15 @@ end
 
 function complete_loglik(data::LatentData{T}, state::GibbsState{T}; cache = covcache(state.model)) where {T}
     s = zero(T)
+    work = Vector{T}(undef, size(data.X[1], 1))
     for i in eachindex(data.X)
         Xi, zi, mui = data.X[i], state.z[i], state.model.mu[i]
         p = clamp(state.model.pi[i], eps(T), one(T) - eps(T))
         n1 = count(zi)
         s += n1 * log(p) + (length(zi) - n1) * log1p(-p)
-        @views for j in axes(Xi, 2)
+        for j in axes(Xi, 2)
             k = zi[j] ? 1 : 2
-            s += gaussian_logpdf(Xi[:, j], mui[:, k], state.model.lambda[i, k], cache[k])
+            s += gaussian_logpdf_col!(work, Xi, j, mui, k, state.model.lambda[i, k], cache[k])
         end
     end
     s
@@ -211,9 +221,13 @@ function logprior(model::LatentGMM{T}, prior::LatentPrior{T}; pcache = priorcach
     for p in model.pi
         s += logpdf(pcache.beta, clamp(p, eps(T), one(T) - eps(T)))
     end
+    r = Vector{T}(undef, length(prior.m0))
+    v = similar(r)
     for M in model.mu, k in 1:2
-        r = M[:, k] - pcache.centers[k]
-        v = pcache.F0.U * r
+        @inbounds for j in eachindex(r)
+            r[j] = M[j, k] - pcache.centers[k][j]
+        end
+        mul!(v, pcache.F0.U, r)
         s += 0.5 * (pcache.logdet0 - length(r) * log(2π) - dot(v, v))
     end
     for λ in model.lambda
@@ -232,13 +246,17 @@ function gibbs_step!(rng::AbstractRNG, data::LatentData{T}, state::GibbsState{T}
     model = state.model
     p = size(data.X[1], 1)
     cache = covcache(model)
+    work1 = Vector{T}(undef, p)
+    work2 = similar(work1)
 
     for i in eachindex(data.X)
         Xi, zi, mui = data.X[i], state.z[i], model.mu[i]
         q = clamp(model.pi[i], eps(T), one(T) - eps(T))
-        @views for j in axes(Xi, 2)
-            a = log(q) + gaussian_logpdf(Xi[:, j], mui[:, 1], model.lambda[i, 1], cache[1])
-            b = log1p(-q) + gaussian_logpdf(Xi[:, j], mui[:, 2], model.lambda[i, 2], cache[2])
+        lp1, lp2 = log(q), log1p(-q)
+        λ1, λ2 = model.lambda[i, 1], model.lambda[i, 2]
+        for j in axes(Xi, 2)
+            a = lp1 + gaussian_logpdf_col!(work1, Xi, j, mui, 1, λ1, cache[1])
+            b = lp2 + gaussian_logpdf_col!(work2, Xi, j, mui, 2, λ2, cache[2])
             zi[j] = rand(rng) < exp(a - logsumexp2(a, b))
         end
         n1 = count(zi)
@@ -246,53 +264,80 @@ function gibbs_step!(rng::AbstractRNG, data::LatentData{T}, state::GibbsState{T}
     end
 
     Sinv = ntuple(k -> Matrix(cache[k][1] \ Matrix{T}(I, p, p)), 2)
+    sx = Matrix{T}(undef, p, 2)
+    tmp = Vector{T}(undef, p)
+    noise = similar(tmp)
+    b = Vector{T}(undef, p)
+    Q = Matrix{T}(undef, p, p)
     for i in eachindex(data.X)
         Xi, zi, Mui = data.X[i], state.z[i], model.mu[i]
-        for k in 1:2
-            n = 0
-            sx = zeros(T, p)
-            @views for j in axes(Xi, 2)
-                (zi[j] == (k == 1)) || continue
-                sx .+= Xi[:, j]
-                n += 1
+        fill!(sx, zero(T))
+        n1 = 0
+        @inbounds for j in axes(Xi, 2)
+            if zi[j]
+                for r in 1:p
+                    sx[r, 1] += Xi[r, j]
+                end
+                n1 += 1
+            else
+                for r in 1:p
+                    sx[r, 2] += Xi[r, j]
+                end
             end
-            Q = prior.Lambda0 + (n * model.lambda[i, k]) * Sinv[k]
-            b = pcache.eta0[k] + model.lambda[i, k] * (Sinv[k] * sx)
-            Mui[:, k] .= rand_precision_normal(rng, Q, b)
         end
-    end
-
-    for i in eachindex(data.X)
-        Xi, zi, Mui = data.X[i], state.z[i], model.mu[i]
+        ns = (n1, size(Xi, 2) - n1)
         for k in 1:2
-            qsum, n = zero(T), 0
-            @views for j in axes(Xi, 2)
-                (zi[j] == (k == 1)) || continue
-                r = Xi[:, j] - Mui[:, k]
-                qsum += dot(r, cache[k][1] \ r)
-                n += 1
-            end
-            shape = prior.a0 + T(0.5 * p * n)
-            rate = prior.b0 + T(0.5) * qsum
-            model.lambda[i, k] = rand(rng, Gamma(shape, inv(rate)))
-        end
-    end
-
-    for k in 1:2
-        S = copy(prior.S0[k])
-        n = 0
-        for i in eachindex(data.X)
-            Xi, zi, Mui = data.X[i], state.z[i], model.mu[i]
+            n = ns[k]
             λ = model.lambda[i, k]
-            @views for j in axes(Xi, 2)
-                (zi[j] == (k == 1)) || continue
-                r = Xi[:, j] - Mui[:, k]
-                BLAS.ger!(λ, r, r, S)
-                n += 1
+            Q .= prior.Lambda0
+            @. Q += (n * λ) * Sinv[k]
+            mul!(tmp, Sinv[k], view(sx, :, k))
+            @. b = pcache.eta0[k] + λ * tmp
+            rand_precision_normal!(rng, view(Mui, :, k), Q, b, noise)
+        end
+    end
+
+    work = work1
+    for i in eachindex(data.X)
+        Xi, zi, Mui = data.X[i], state.z[i], model.mu[i]
+        qsum1, qsum2 = zero(T), zero(T)
+        n1, n2 = 0, 0
+        for j in axes(Xi, 2)
+            if zi[j]
+                qsum1 += quadform_col!(work, Xi, j, Mui, 1, cache[1])
+                n1 += 1
+            else
+                qsum2 += quadform_col!(work, Xi, j, Mui, 2, cache[2])
+                n2 += 1
             end
         end
-        model.Sigma[k] .= rand(rng, InverseWishart(prior.nu0 + n, PDMat(Symmetric(S))))
+        shape1 = prior.a0 + T(0.5 * p * n1)
+        rate1 = prior.b0 + T(0.5) * qsum1
+        model.lambda[i, 1] = rand(rng, Gamma(shape1, inv(rate1)))
+        shape2 = prior.a0 + T(0.5 * p * n2)
+        rate2 = prior.b0 + T(0.5) * qsum2
+        model.lambda[i, 2] = rand(rng, Gamma(shape2, inv(rate2)))
     end
+
+    S1 = copy(prior.S0[1])
+    S2 = copy(prior.S0[2])
+    n1, n2 = 0, 0
+    for i in eachindex(data.X)
+        Xi, zi, Mui = data.X[i], state.z[i], model.mu[i]
+        for j in axes(Xi, 2)
+            if zi[j]
+                residual_col!(work, Xi, j, Mui, 1)
+                BLAS.ger!(model.lambda[i, 1], work, work, S1)
+                n1 += 1
+            else
+                residual_col!(work, Xi, j, Mui, 2)
+                BLAS.ger!(model.lambda[i, 2], work, work, S2)
+                n2 += 1
+            end
+        end
+    end
+    model.Sigma[1] .= rand(rng, InverseWishart(prior.nu0 + n1, PDMat(Symmetric(S1))))
+    model.Sigma[2] .= rand(rng, InverseWishart(prior.nu0 + n2, PDMat(Symmetric(S2))))
     state
 end
 

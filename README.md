@@ -22,3 +22,5 @@ The plotter validates that allocation and regression `.jls` artifacts contain lo
 Use `--burn-in N` to discard the first `N` allocation and regression samples in the plots and summaries, or `--allocation-burn-in N` / `--regression-burn-in N` to control them separately. The same defaults can be set in the parameter file under `[plotting]`.
 
 Generate a grid of TOML parameter files by editing the choice arrays at the top of `generate_toml_configs.jl`, then running `julia --project=. --startup-file=no generate_toml_configs.jl`.
+
+Validate the Mooncake AD backend with finite-difference gradient checks and tiny dense/gamma HMC smoke runs via `julia --project=. --startup-file=no validate_mooncake_ad.jl`.
