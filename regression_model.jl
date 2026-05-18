@@ -1,6 +1,9 @@
 using LinearAlgebra, Random, Statistics, Distributions, Logging
-using AdvancedHMC, LogDensityProblems, LogDensityProblemsAD, Zygote
+using AdvancedHMC, LogDensityProblems, LogDensityProblemsAD
+using ADTypes, DifferentiationInterface, Mooncake
 include("progress_helpers.jl")
+
+const REGRESSION_AD_BACKEND = ADTypes.AutoMooncake()
 
 struct SupervisedData{T<:AbstractFloat,Y<:Real}
     cluster_a_μ::Matrix{T}   # n x p
@@ -170,7 +173,7 @@ end
 function regression_logdensity_model(model::RegressionModel, data::SupervisedData)
     supports_hmc_prior(model.β_prior) || error("Joint HMC currently supports Normal or MvNormal priors for β.")
     target = RegressionTarget(model, data)
-    AdvancedHMC.LogDensityModel(LogDensityProblemsAD.ADgradient(Val(:Zygote), target))
+    AdvancedHMC.LogDensityModel(LogDensityProblemsAD.ADgradient(REGRESSION_AD_BACKEND, target))
 end
 
 statfield(stat, name::Symbol, default) = hasproperty(stat, name) ? getproperty(stat, name) : default
@@ -251,7 +254,7 @@ function gamma_density_model(model::GammaRegressionModel, data::SupervisedData, 
                                Matrix(data.cluster_a_μ[:, active]),
                                Matrix(data.cluster_b_μ[:, active]),
                                data.y)
-    AdvancedHMC.LogDensityModel(LogDensityProblemsAD.ADgradient(Val(:Zygote), target))
+    AdvancedHMC.LogDensityModel(LogDensityProblemsAD.ADgradient(REGRESSION_AD_BACKEND, target))
 end
 
 function gamma_hmc_state(model::GammaRegressionModel, data::SupervisedData, β::AbstractVector, gamma::BitVector, u::Real)
