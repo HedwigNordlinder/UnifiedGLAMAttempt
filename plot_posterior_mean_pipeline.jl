@@ -65,7 +65,7 @@ function pipeline_plot(alloc_logpost, reg_fit, β_true; latent_burn, latent_ndra
     plot!(plt[6]; framestyle = :none, grid = false, ticks = false, xlims = (0, 1), ylims = (0, 1))
     annotate!(plt[6], 0.02, 0.92, text("Posterior-Mean Pipeline", 13, :left))
     annotate!(plt[6], 0.02, 0.76, text(@sprintf("latent mean draws: %d", latent_ndraws), 11, :left))
-    annotate!(plt[6], 0.02, 0.62, text(@sprintf("reg mean accept: %.3f", reg_fit.mean_acceptance), 11, :left))
+    annotate!(plt[6], 0.02, 0.62, text(@sprintf("reg mean accept prob: %.3f", reg_fit.mean_acceptance), 11, :left))
     annotate!(plt[6], 0.02, 0.48, text(@sprintf("reg divergence: %.3f", reg_fit.divergence_rate), 11, :left))
     annotate!(plt[6], 0.02, 0.32, text(@sprintf("true t: %.3f", t_true), 11, :left))
     annotate!(plt[6], 0.02, 0.18, text(@sprintf("post mean t: %.3f", mean(reg_fit.t_chain)), 11, :left))
@@ -109,7 +109,7 @@ function main()
     println("latent posterior-mean draws: ", length(latent_states))
     println("posterior mean t: ", round(mean(reg_fit.t_chain), digits = 4))
     println("true t: ", round(sim.bundle.regression_truth.t, digits = 4))
-    println("mean acceptance: ", round(reg_fit.mean_acceptance, digits = 3))
+    println("mean HMC accept prob: ", round(reg_fit.mean_acceptance, digits = 3))
     println("divergence rate: ", round(reg_fit.divergence_rate, digits = 3))
 end
 

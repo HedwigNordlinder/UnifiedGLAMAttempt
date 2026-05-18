@@ -420,7 +420,7 @@ function run_engine(parameter_file::AbstractString)
         phase_log(run_progress, "dense regression HMC: nsweeps=$nsweeps n_adapts=$n_adapts burn=$burn thin=$thin")
     end
     reg_fit = run_regression(rng, params, reg_model, fit_data)
-    phase_log(run_progress, "regression complete: mean_acceptance=$(round(reg_fit.mean_acceptance; digits=3)) divergence_rate=$(round(reg_fit.divergence_rate; digits=3))")
+    phase_log(run_progress, "regression complete: mean_accept_prob=$(round(reg_fit.mean_acceptance; digits=3)) divergence_rate=$(round(reg_fit.divergence_rate; digits=3))")
 
     alloc_payload = (; fit = alloc_fit,
                      logpost_trace = alloc_fit.logpost,
@@ -483,7 +483,7 @@ function run_engine(parameter_file::AbstractString)
     println("saved run metadata: ", run_paths.jls_path)
     println("posterior mean t: ", round(reg_payload.summary.t_mean, digits = 4))
     println("true t: ", round(reg_payload.summary.t_true, digits = 4))
-    println("mean acceptance: ", round(reg_payload.summary.mean_acceptance, digits = 3))
+    println("mean HMC accept prob: ", round(reg_payload.summary.mean_acceptance, digits = 3))
     println("divergence rate: ", round(reg_payload.summary.divergence_rate, digits = 3))
 
     (; paths = merge(paths, (; run = run_paths)), run = run_payload)

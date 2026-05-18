@@ -4,4 +4,4 @@ TransformVariables.jl
 *.jls
 *.png
 *.pdf
-
+generated_configs/

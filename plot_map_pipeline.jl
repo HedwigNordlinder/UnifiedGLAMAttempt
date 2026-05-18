@@ -63,7 +63,7 @@ function pipeline_plot(alloc_logpost, imap, reg_fit, β_true; t_true, burn = 0, 
     plot!(plt[6]; framestyle = :none, grid = false, ticks = false, xlims = (0, 1), ylims = (0, 1))
     annotate!(plt[6], 0.02, 0.92, text("MAP pipeline summary", 13, :left))
     annotate!(plt[6], 0.02, 0.76, text(@sprintf("allocation MAP iter: %d", imap), 11, :left))
-    annotate!(plt[6], 0.02, 0.60, text(@sprintf("reg mean accept: %.3f", reg_fit.mean_acceptance), 11, :left))
+    annotate!(plt[6], 0.02, 0.60, text(@sprintf("reg mean accept prob: %.3f", reg_fit.mean_acceptance), 11, :left))
     annotate!(plt[6], 0.02, 0.46, text(@sprintf("reg divergence: %.3f", reg_fit.divergence_rate), 11, :left))
     annotate!(plt[6], 0.02, 0.30, text(@sprintf("true t: %.3f", t_true), 11, :left))
     annotate!(plt[6], 0.02, 0.16, text(@sprintf("post mean t: %.3f", mean(reg_fit.t_chain)), 11, :left))
@@ -104,7 +104,7 @@ function main()
     println("allocation MAP iteration: ", imap)
     println("posterior mean t: ", round(mean(reg_fit.t_chain), digits = 4))
     println("true t: ", round(sim.bundle.regression_truth.t, digits = 4))
-    println("mean acceptance: ", round(reg_fit.mean_acceptance, digits = 3))
+    println("mean HMC accept prob: ", round(reg_fit.mean_acceptance, digits = 3))
     println("divergence rate: ", round(reg_fit.divergence_rate, digits = 3))
 end
 

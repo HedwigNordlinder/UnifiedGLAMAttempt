@@ -72,7 +72,7 @@ function pipeline_plot(alloc_logpost, imap, reg_fit, truth; t_true, path = "gamm
     annotate!(plt[6], 0.02, 0.78, text(@sprintf("allocation MAP iter: %d", imap), 11, :left))
     annotate!(plt[6], 0.02, 0.64, text(@sprintf("true active: %d/%d", count(truth.gamma), length(truth.gamma)), 11, :left))
     annotate!(plt[6], 0.02, 0.50, text(@sprintf("post active mean: %.1f", mean(reg_fit.active_trace)), 11, :left))
-    annotate!(plt[6], 0.02, 0.36, text(@sprintf("reg mean accept: %.3f", reg_fit.mean_acceptance), 11, :left))
+    annotate!(plt[6], 0.02, 0.36, text(@sprintf("reg mean accept prob: %.3f", reg_fit.mean_acceptance), 11, :left))
     annotate!(plt[6], 0.02, 0.22, text(@sprintf("reg divergence: %.3f", reg_fit.divergence_rate), 11, :left))
     annotate!(plt[6], 0.02, 0.08, text(@sprintf("true t: %.3f, post t: %.3f", t_true, mean(reg_fit.t_chain)), 11, :left))
 
@@ -123,7 +123,7 @@ function main()
     println("gamma recovery [P(s0|t0) P(s1|t0); P(s0|t1) P(s1|t1)]: ", round.(G; digits = 3))
     println("initial step size: ", round(reg_fit.initial_step_size, digits = 5))
     println("mean chunk step size: ", round(reg_fit.mean_step_size, digits = 5))
-    println("mean acceptance: ", round(reg_fit.mean_acceptance, digits = 3))
+    println("mean HMC accept prob: ", round(reg_fit.mean_acceptance, digits = 3))
     println("divergence rate: ", round(reg_fit.divergence_rate, digits = 3))
 end
 

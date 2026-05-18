@@ -175,10 +175,16 @@ end
 
 statfield(stat, name::Symbol, default) = hasproperty(stat, name) ? getproperty(stat, name) : default
 
+function hmc_acceptance_probability(stat)
+    raw = Float64(statfield(stat, :acceptance_rate, NaN))
+    isfinite(raw) || return raw
+    clamp(raw, 0.0, 1.0)
+end
+
 function push_hmc_stats!(accept::Vector{Float64}, tree_depth::Vector{Int},
                          numerical_error::BitVector, transition)
     stat = transition.stat
-    push!(accept, Float64(statfield(stat, :acceptance_rate, NaN)))
+    push!(accept, hmc_acceptance_probability(stat))
     push!(tree_depth, Int(statfield(stat, :tree_depth, 0)))
     push!(numerical_error, Bool(statfield(stat, :numerical_error, false)))
     nothing
@@ -207,7 +213,7 @@ function run_hmc_steps(rng::AbstractRNG, density_model, sampler, θ0::AbstractVe
         )
         push_hmc_stats!(accept, tree_depth, numerical_error, transition)
         save_transitions && (transitions[1] = transition)
-        progress_update!(prog, 1; suffix = "accept=$(round(accept[end]; digits=3)) depth=$(tree_depth[end])")
+        progress_update!(prog, 1; suffix = "accept_prob=$(round(accept[end]; digits=3)) depth=$(tree_depth[end])")
         for _ in 2:nsteps
             transition, hmc_state = AdvancedHMC.AbstractMCMC.step(
                 rng,
@@ -221,7 +227,7 @@ function run_hmc_steps(rng::AbstractRNG, density_model, sampler, θ0::AbstractVe
             push_hmc_stats!(accept, tree_depth, numerical_error, transition)
             i = length(accept)
             save_transitions && (transitions[i] = transition)
-            progress_update!(prog, i; suffix = "accept=$(round(accept[end]; digits=3)) depth=$(tree_depth[end])")
+            progress_update!(prog, i; suffix = "accept_prob=$(round(accept[end]; digits=3)) depth=$(tree_depth[end])")
         end
         (; transition, hmc_state, accept, tree_depth, numerical_error, transitions)
     end
@@ -419,7 +425,7 @@ function gamma_hmc(rng::AbstractRNG, model::GammaRegressionModel, data::Supervis
         tree_depth[it] = hmc_stats.tree_depth
         numerical_error[it] = hmc_stats.numerical_error
         active_trace[it] = count(gamma)
-        progress_update!(prog, it; suffix = "t=$(round(tt; digits=3)) active=$(active_trace[it]) accept=$(round(accept_trace[it]; digits=3))")
+        progress_update!(prog, it; suffix = "t=$(round(tt; digits=3)) active=$(active_trace[it]) accept_prob=$(round(accept_trace[it]; digits=3))")
         if save_states
             states[it] = GammaRegressionHMCState(copy(β), copy(gamma), u, loglik[it], logpost[it])
         end
@@ -498,7 +504,7 @@ function hmc(rng::AbstractRNG, model::RegressionModel, data::SupervisedData;
         logpost[it] = ℓ_posterior(model, data, β, tt)
         logtarget[it] = transformed_logtarget(model, data, β, u)
         t_trace[it] = tt
-        accept_trace[it] = Float64(statfield(stat, :acceptance_rate, NaN))
+        accept_trace[it] = hmc_acceptance_probability(stat)
         step_size[it] = Float64(statfield(stat, :step_size, NaN))
         nom_step_size[it] = Float64(statfield(stat, :nom_step_size, NaN))
         tree_depth[it] = Int(statfield(stat, :tree_depth, 0))

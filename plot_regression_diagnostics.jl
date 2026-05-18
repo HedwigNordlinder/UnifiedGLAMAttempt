@@ -47,7 +47,7 @@ function main()
     path = diagnostic_plot(fit.t_trace, fit.logpost; burn = burn, path = "regression_chain_diagnostics.png")
     println("saved diagnostics plot: ", abspath(path))
     println("posterior mean t after burn: ", round(mean(fit.t_trace[burn + 1:end]), digits = 4))
-    println("mean acceptance: ", round(fit.mean_acceptance, digits = 3))
+    println("mean HMC accept prob: ", round(fit.mean_acceptance, digits = 3))
     println("divergence rate: ", round(fit.divergence_rate, digits = 3))
 end
 

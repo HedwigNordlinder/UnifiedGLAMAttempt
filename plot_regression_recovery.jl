@@ -54,7 +54,7 @@ function main()
     println("saved bundle (.jls): ", abspath(sim.paths.jls_path))
     println("posterior mean t: ", round(mean(fit.t_chain), digits = 4))
     println("true t: ", round(sim.bundle.regression_truth.t, digits = 4))
-    println("mean acceptance: ", round(fit.mean_acceptance, digits = 3))
+    println("mean HMC accept prob: ", round(fit.mean_acceptance, digits = 3))
     println("divergence rate: ", round(fit.divergence_rate, digits = 3))
 end
 
